@@ -9,6 +9,9 @@
             .url = "https://github.com/xcaeser/zli/archive/refs/heads/main.tar.gz",
             .hash = "zli-5.1.2-LeUjppgGAQBJTvBa8JVyxflH9CNPWqcaPuEeLZ6nPUEm",
         },
+        .yaml = .{
+            .path = "vendor/yaml",
+        },
     },
 
     .paths = .{

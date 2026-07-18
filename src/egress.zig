@@ -383,7 +383,7 @@ test "egress: bind source address to loopback" {
 }
 
 test "egress: bind source address with specific port" {
-    var sock = try Socket.initUdp(.{ .source_addr = "127.0.0.1:12345" });
+    var sock = try Socket.initUdp(.{ .source_addr = "127.0.0.1:23456" });
     defer sock.close();
     try testing.expect(sock.fd != INVALID_SOCKET);
 }
