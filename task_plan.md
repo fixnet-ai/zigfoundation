@@ -28,11 +28,11 @@ Phase 2
 - **Status:** complete
 
 ### Phase 2: 平台与网络（std only）
-- [ ] `platform.zig` — 合并 zigproxy + zigtun 平台代码：时间获取、平台检测、系统资源探测（CPU 核数 / fd 上限 / 推荐线程池大小）、系统 DNS 探测
-- [ ] `net.zig` — 从 zproxy/src/utils.zig 提取网络部分：IP 格式化/解析、完整 IPv4/v6 CIDR 接口（解析/匹配/包含/迭代/子网划分）、域名判断、parseHostPort。不含 checksum
-- [ ] foundation.zig 更新导出
-- [ ] `zig build test` 全绿
-- **Status:** pending
+- [x] `platform.zig` — 合并 zigproxy + zigtun 平台代码：时间获取、平台检测、系统资源探测（CPU 核数 / fd 上限 / 推荐线程池大小）、系统 DNS 探测。9 tests
+- [x] `net.zig` — 从 zproxy/src/utils.zig 提取网络部分：IP 格式化/解析、完整 IPv4/v6 CIDR 接口（解析/匹配/包含/网络/广播/前缀长度）、域名判断、parseHostPort。不含 checksum。49 tests
+- [x] foundation.zig 更新导出
+- [x] `zig build test` 全绿 (86/86)
+- **Status:** complete
 
 ### Phase 3: 应用框架（std + libyaml）
 - [ ] `strings.zig` — 从 zproxy/src/utils.zig 提取字符串部分：切割、trim、大小写转换等

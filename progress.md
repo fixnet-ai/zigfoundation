@@ -40,10 +40,26 @@
   - src/endian.zig (created)
   - src/foundation.zig (updated — barrel export + test registration)
 
+### Phase 2: 平台与网络（std only）
+- **Status:** complete
+- Actions taken:
+  - 创建 `platform.zig` — 合并 zigproxy + zigtun 平台代码。平台检测 (isDarwin/isLinux/isWindows/isMobile)、跨平台时间 (monoMillis/monoMicros/monoNanos/absoluteMillis)、系统资源 (getCpuCount/getMaxFds/raiseMaxFds/getRecommendedPoolSize)、系统 DNS 探测 (detectSystemDns)。信号处理移至 cli.zig (Phase 3)。9 tests
+  - 创建 `net.zig` — 从 zproxy/utils.zig + ip_cidr6.zig + ip_cidr.zig 提取，适配 Zig 0.16.0，去除 zio 依赖。IP 格式化 (formatIpv4/formatIpv6)、字节↔整数转换 (ip4ToInt/intToIp4/ip6ToInt/intToIp6)、IP 字符串解析 (parseIpv4/parseIpv6 via std.Io.net)、地址类型判断 (isIpv4/isIpv6/isDomain)、验证 (isValidPort/isValidIpv4String/isValidIpv6String/isValidDomain/isValidHost)、IPv4 CIDR (Cidr4: parse/contains/network/broadcast/netmask/prefixLen/format)、IPv6 CIDR (Cidr6: parse/contains/network/prefixLen/next/format)、host:port 解析 (parseHostPort/buildHostPort)。49 tests
+  - 修复：parseIpv4 错误类型适配 (Overflow/Incomplete/InvalidCharacter)、Cidr4.format/Cidr6.format buffer 别名问题、isValidHost 的 "256.0.0.0" 回退到 isValidDomain 的可接受行为
+  - 更新 `foundation.zig` — barrel 导出 platform + net，注册测试
+  - `zig build test` 86/86 全绿 + `zig build` 成功 + `zig fmt --check` 通过
+- Files created/modified:
+  - src/platform.zig (created)
+  - src/net.zig (created)
+  - src/foundation.zig (updated — barrel export)
+
 ## Test Results
 | Test | Input | Expected | Actual | Status |
 |------|-------|----------|--------|--------|
-| zig build test | 全量 28 tests | 全绿 | 28/28 passed | ✓ |
+| Phase 1 (28 tests) | ring/buffer/endian | 全绿 | 28/28 passed | ✓ |
+| Phase 2 platform (9 tests) | 平台检测/时间/资源/DNS | 全绿 | 9/9 passed | ✓ |
+| Phase 2 net (49 tests) | IP/验证/CIDR/host:port | 全绿 | 49/49 passed | ✓ |
+| **Total** | **86 tests** | **全绿** | **86/86 passed** | **✓** |
 | zig build | 静态库 | 成功 | 成功 | ✓ |
 | zig fmt --check | 源码格式 | 通过 | 通过 | ✓ |
 
@@ -54,11 +70,11 @@
 ## 5-Question Reboot Check
 | Question | Answer |
 |----------|--------|
-| 我在哪里？ | Phase 1 完成 → Phase 2 (平台与网络)，即将开始 |
-| 我要去哪里？ | Phase 2 → 3(应用框架) → 4(存储并发) → 5(网络出站) → 6(集成验证) |
+| 我在哪里？ | Phase 2 (平台与网络) 完成 → Phase 3 (应用框架) 即将开始 |
+| 我要去哪里？ | Phase 3 (应用框架: strings/cli/log/yaml) → 4 (存储并发) → 5 (网络出站) → 6 (集成验证) |
 | 目标是什么？ | 提取 13 个工业级基础模块（std + libxev + libyaml），100% 测试覆盖，五平台 |
-| 我学到了什么？ | 见 findings.md（提取源审计、依赖分层、排除项、命名决策） |
-| 我做了什么？ | Phase 0 全部完成：骨架 + zig-codegen + Git 基础环境 + 规划重写 |
+| 我学到了什么？ | 见 findings.md；net.zig: Zig 0.16.0 std.Io.net.Ip4Address.parse 错误类型因输入而异 (Overflow/Incomplete/InvalidCharacter)；bufPrint 复用同一 buffer 会触发 @memcpy alias panic；isValidHost 对 "256.0.0.0" 会回退到 isValidDomain（行为与 zproxy 一致） |
+| 我做了什么？ | Phase 2 全部完成：platform.zig (9 tests) + net.zig (49 tests) = 86/86 全绿 |
 
 ---
 *每个阶段完成或遇到错误后更新此文件*

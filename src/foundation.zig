@@ -24,9 +24,9 @@ pub const buffer = @import("buffer.zig");
 pub const ring = @import("ring.zig");
 pub const endian = @import("endian.zig");
 
-// ---- 待实现模块 ----
-// pub const platform = @import("platform.zig"); // Phase 2
-// pub const net = @import("net.zig");           // Phase 2
+// ---- Phase 2: 平台与网络 (std only) ----
+pub const platform = @import("platform.zig");
+pub const net = @import("net.zig");
 // pub const strings = @import("strings.zig");   // Phase 3
 // pub const cli = @import("cli.zig");           // Phase 3
 // pub const log = @import("log.zig");           // Phase 3
@@ -41,4 +41,6 @@ test {
     _ = @import("buffer.zig");
     _ = @import("ring.zig");
     _ = @import("endian.zig");
+    _ = @import("platform.zig");
+    _ = @import("net.zig");
 }
