@@ -74,12 +74,25 @@ std + libxev (4 modules):
 | store 路径注入 | 注入模式，调用者传入路径并初始化，模块不持有全局状态 |
 | 不含 DNS | 应用层，属于 zproxy/zigproxy |
 | 不含 checksum | 不提供 |
+| Vendored C 库独立 Zig package | 每个内嵌 C 库有独立 build.zig + build.zig.zon，防止根 build.zig 臃肿；`b.addModule("name", opts)` 公开模块供依赖方 `dep.module()` 获取 |
+| `b.addModule` vs `b.createModule` | addModule = 公开（注册到 b.modules，可被依赖方访问）；createModule = 私有（内部使用）。vendor package 必须用 addModule |
+| NDK arch include 使用预设列表 | `target.result.zigTriple()` 在 dependency 中返回宿主 triple，无法动态计算目标 triple |
+| Android 动态链接（.linkage = .dynamic） | NDK 30 的 `libc.a` 包含 Rust std 代码需 libunwind，无法静态链接；Zig 动态链接自动设置 `/system/bin/linker64` + PIE |
+| Android 日志：stderr 自动到 logcat | 移除 `__android_log_write` + liblog 依赖，Android 原生程序 stderr 输出自动路由到 logcat |
+| `testLog()` 必须恢复日志级别 | 全局 `log_level` 状态污染的副作用：testLog 最后一行必须 `setLevel(.info)`，否则后续 PASS 不可见 |
 
 ## Issues Encountered
 | Issue | Resolution |
 |-------|------------|
 | CLAUDE.md 跨项目引用路径错误（../zigtun/ 已不存在） | 修正为 ./ 本地路径引用 |
 | 原计划 11 模块 → 13 模块 | socket.zig（出站路由绑定）、yaml.zig（libyaml 封装）新增；平台/网络/signal/resource 明确划入对应模块 |
+| vendor/yaml 重构后 iOS/Android 交叉编译失败 | vendor/yaml/build.zig 添加 sysroot include paths（`usr/include` + NDK 架构特定目录） |
+| `b.sysroot` 全局设置不传播到 dependency C 编译 include path | 需在 dependency build.zig 中手动 `addSystemIncludePath` |
+| Dependency 中 `b.standardTargetOptions` 无法获取交叉编译目标 triple | 返回宿主 triple，需用预设列表替代动态目录扫描 |
+| Zig 0.16.0 libc conf 要求全部 6 字段 | msvc_lib_dir / kernel32_lib_dir / gcc_dir 即使 Android 不需要也必须声明（空值） |
+| NDK 库文件在版本化子目录 linker 找不到 | 创建 symlink 从 `<triple>/` → `<triple>/36/`（libc/libm/libdl .so + .a） |
+| `linkSystemLibrary("log")` Zig 构建系统无法定位 | Android log.zig 改为 stderr 输出，移除 liblog 依赖 |
+| GitHub MCP 插件需 `GITHUB_PERSONAL_ACCESS_TOKEN` | 从 `gh auth token` 获取 → `~/.bash_profile` export |
 
 ## Resources
 - zproxy 参考：`../zproxy/src/utils.zig`、`core/event.zig`、`core/ringbuf.zig`、`core/queue.zig`、`platform/`

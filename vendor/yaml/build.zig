@@ -38,4 +38,26 @@ pub fn build(b: *std.Build) void {
     });
     yaml_c_mod.addIncludePath(b.path("src"));
     yaml_c_mod.addIncludePath(b.path("include"));
+
+    // 交叉编译时添加 sysroot include path (iOS/Android)
+    // b.sysroot 由根 build.zig 通过 -Dsysroot=... 设置，全局传播到依赖项
+    if (b.sysroot) |s| {
+        const sysroot_include = b.pathJoin(&.{ s, "usr", "include" });
+        yaml_c_mod.addSystemIncludePath(.{ .cwd_relative = sysroot_include });
+
+        // Android NDK: 架构特定头文件路径 (asm/types.h 等内核头)
+        // NDK 将 asm/ 放在 usr/include/<arch>-linux-android/ 下。
+        // 依赖包中无法直接用 b.standardTargetOptions 获取交叉编译目标 triple，
+        // 因此添加所有常见 Android 架构目录 (不存在的目录 clang 仅警告，不影响编译)
+        const common_android_archs = [_][]const u8{
+            "aarch64-linux-android",
+            "arm-linux-androideabi",
+            "x86_64-linux-android",
+            "i686-linux-android",
+        };
+        for (common_android_archs) |triple| {
+            const arch_inc = b.pathJoin(&.{ s, "usr", "include", triple });
+            yaml_c_mod.addSystemIncludePath(.{ .cwd_relative = arch_inc });
+        }
+    }
 }

@@ -1,8 +1,14 @@
 import UIKit
+import OSLog
 
-// C function from the Zig static library
+// C functions from the Zig static library
 @_silgen_name("runAllTests")
 func runAllTests() -> Bool
+
+@_silgen_name("getResultsBuf")
+func getResultsBuf() -> UnsafePointer<CChar>
+
+let logger = Logger(subsystem: "com.fixnet.zigfoundation", category: "test")
 
 @main
 class AppDelegate: UIResponder, UIApplicationDelegate {
@@ -12,6 +18,8 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
         _ application: UIApplication,
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
     ) -> Bool {
+        logger.info("zigfoundation iOS test app launched")
+
         window = UIWindow(frame: UIScreen.main.bounds)
         let vc = ViewController()
         window?.rootViewController = vc
@@ -25,14 +33,28 @@ class ViewController: UIViewController {
         super.viewDidLoad()
         view.backgroundColor = .systemBackground
 
+        logger.info("viewDidLoad: starting zigfoundation tests...")
+
+        let passed = runAllTests()
+
+        // 读取 Zig 端的结果缓冲区并通过 os.Logger 输出
+        let resultStr = String(cString: getResultsBuf())
+        logger.info("zigfoundation test results: \(resultStr, privacy: .public)")
+
         let label = UILabel()
         label.numberOfLines = 0
         label.textAlignment = .center
         label.font = .monospacedSystemFont(ofSize: 14, weight: .regular)
 
-        let passed = runAllTests()
-        label.text = passed ? "✅ zigfoundation\nAll 13 modules PASSED" : "❌ zigfoundation\nSome tests FAILED\nCheck Console.app for details"
-        label.textColor = passed ? .systemGreen : .systemRed
+        if passed {
+            label.text = "✅ zigfoundation\nAll 13 modules PASSED\n\nCheck: log show --predicate 'subsystem == \"com.fixnet.zigfoundation\"'"
+            label.textColor = .systemGreen
+            logger.info("zigfoundation: ALL TESTS PASSED")
+        } else {
+            label.text = "❌ zigfoundation\nSome tests FAILED\n\nCheck Console.app or log show"
+            label.textColor = .systemRed
+            logger.error("zigfoundation: SOME TESTS FAILED")
+        }
 
         view.addSubview(label)
         label.translatesAutoresizingMaskIntoConstraints = false

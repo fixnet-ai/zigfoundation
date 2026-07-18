@@ -101,6 +101,35 @@ pub fn build(b: *std.Build) void {
     const example_ios_step = b.step("example-ios", "构建 iOS 示例静态库 (用于 Xcode 集成)");
     example_ios_step.dependOn(&example_ios_install.step);
 
+    // ---- iOS 模拟器 CLI 测试 (可直接通过 simctl spawn 运行) ----
+    const ios_test_mod = b.createModule(.{
+        .root_source_file = b.path("examples/ios/test_runner.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    ios_test_mod.addImport("foundation", lib_module);
+    if (sysroot) |s| {
+        const sysroot_include = b.pathJoin(&.{ s, "usr", "include" });
+        ios_test_mod.addSystemIncludePath(.{ .cwd_relative = sysroot_include });
+    }
+
+    const ios_test_exe = b.addExecutable(.{
+        .name = "zigfoundation-ios-test",
+        .root_module = ios_test_mod,
+    });
+    const ios_test_install = b.addInstallArtifact(ios_test_exe, .{});
+    const ios_test_step = b.step("ios-test-runner", "构建 iOS 模拟器 CLI 测试 (simctl spawn 运行)");
+    ios_test_step.dependOn(&ios_test_install.step);
+
+    // ---- iOS 模拟器动态库 (swiftc 链接用，避免静态库 .o 对齐问题) ----
+    const ios_dylib = b.addLibrary(.{
+        .name = "zigfoundation-ios-dylib",
+        .linkage = .dynamic,
+        .root_module = ios_test_mod,
+    });
+    const ios_dylib_install = b.addInstallArtifact(ios_dylib, .{});
+    ios_test_step.dependOn(&ios_dylib_install.step);
+
     // ---- 示例：Android 共享库 (aarch64-linux-android / x86_64-linux-android) ----
     const example_android_mod = b.createModule(.{
         .root_source_file = b.path("examples/android/main.zig"),
@@ -126,4 +155,28 @@ pub fn build(b: *std.Build) void {
     const example_android_install = b.addInstallArtifact(example_android, .{});
     const example_android_step = b.step("example-android", "构建 Android 示例共享库 (用于 JNI 集成)");
     example_android_step.dependOn(&example_android_install.step);
+
+    // ---- Android 可执行测试 (通过 adb push + shell 直接运行) ----
+    const android_test_mod = b.createModule(.{
+        .root_source_file = b.path("examples/android/test_runner.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    android_test_mod.addImport("foundation", lib_module);
+    if (sysroot) |s| {
+        const sysroot_include = b.pathJoin(&.{ s, "usr", "include" });
+        android_test_mod.addSystemIncludePath(.{ .cwd_relative = sysroot_include });
+    }
+
+    const android_test_exe = b.addExecutable(.{
+        .name = "zigfoundation-android-test",
+        .root_module = android_test_mod,
+        .linkage = .dynamic, // Android 使用动态链接 (Bionic linker64)
+    });
+    if (libc_file_opt) |lf| {
+        android_test_exe.setLibCFile(.{ .cwd_relative = lf });
+    }
+    const android_test_install = b.addInstallArtifact(android_test_exe, .{});
+    const android_test_step = b.step("android-test", "构建 Android 可执行测试 (adb push + shell 运行)");
+    android_test_step.dependOn(&android_test_install.step);
 }

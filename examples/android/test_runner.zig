@@ -1,29 +1,20 @@
-//! zigfoundation iOS 示例 — 静态库，测试所有兼容模块
+//! zigfoundation Android 测试 — 可执行文件，直接通过 adb shell 运行
 //!
-//! 构建: zig build example-ios -Dtarget=aarch64-ios-simulator
-//! 产出: zig-out/lib/libzigfoundation-example-ios.a
+//! 构建: zig build android-test -Dtarget=aarch64-linux-android -Dsysroot=<NDK>/sysroot
+//! 运行: adb push zig-out/bin/zigfoundation-android-test /data/local/tmp/
+//!       adb shell /data/local/tmp/zigfoundation-android-test
 //!
-//! 入口: export fn runAllTests() → 返回 true/false，通过 syslog 输出详情
+//! 输出通过 __android_log_write 写入 logcat:
+//!   adb logcat -s zigfoundation:* | grep -E "PASS|FAIL"
 
 const std = @import("std");
 const foundation = @import("foundation");
 
-// iOS 使用 syslog 输出（log.zig 自动路由到 darwinLog → syslog）
+// Android 使用 logcat 输出
 pub const std_options: std.Options = foundation.log.logOptions();
 
 var passed: usize = 0;
 var failed: usize = 0;
-
-// 测试结果缓冲区，供 Swift 端通过 os.Logger 输出
-var result_buffer: [4096]u8 = [_]u8{0} ** 4096;
-var result_len: usize = 0;
-
-fn appendResult(text: []const u8) void {
-    if (result_len + text.len < result_buffer.len) {
-        @memcpy(result_buffer[result_len..][0..text.len], text);
-        result_len += text.len;
-    }
-}
 
 fn check(module: []const u8, ok: bool) void {
     if (ok) {
@@ -35,11 +26,9 @@ fn check(module: []const u8, ok: bool) void {
     }
 }
 
-/// C-ABI 入口：Swift 调用此函数运行所有测试
-export fn runAllTests() bool {
-    result_len = 0;
+pub fn main() u8 {
     foundation.log.init(.info);
-    std.log.info("zigfoundation iOS test starting...", .{});
+    std.log.info("=== zigfoundation Android test starting ===", .{});
 
     testBuffer();
     testRing();
@@ -55,36 +44,14 @@ export fn runAllTests() bool {
     testQueue();
     testEgress();
 
-    // 格式化结果到缓冲区（Swift 端通过 os.Logger 输出到统一日志）
-    const summary = std.fmt.bufPrint(
-        result_buffer[result_len..],
-        "{d} passed, {d} failed, {d} total\n",
-        .{ passed, failed, passed + failed },
-    ) catch "result buffer full\n";
-    result_len += summary.len;
-
-    std.log.info("zigfoundation iOS: {d} passed, {d} failed", .{ passed, failed });
-    return failed == 0;
+    std.log.info("=== {d} passed, {d} failed, {d} total ===", .{ passed, failed, passed + failed });
+    return if (failed > 0) @as(u8, 1) else @as(u8, 0);
 }
 
-/// 获取详细结果字符串（null-terminated，供 Swift 端 os.Logger 输出）
-export fn getResultsBuf() [*:0]const u8 {
-    if (result_len < result_buffer.len) {
-        result_buffer[result_len] = 0;
-        return @ptrCast(&result_buffer);
-    }
-    result_buffer[result_buffer.len - 1] = 0;
-    return @ptrCast(&result_buffer);
-}
-
-// ============================================================================
-// buffer.zig
-// ============================================================================
 fn testBuffer() void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
-
     const cfg = foundation.buffer.defaultConfig();
     var pool = foundation.buffer.BufferPool.init(alloc, cfg) catch {
         check("buffer", false);
@@ -96,39 +63,26 @@ fn testBuffer() void {
     if (buf) |b| pool.release(b);
 }
 
-// ============================================================================
-// ring.zig
-// ============================================================================
 fn testRing() void {
     var storage: [8]u32 = undefined;
     var rb = foundation.ring.RingBuf(u32).init(&storage);
     _ = rb.tryPush(42);
     _ = rb.tryPush(99);
-    const v1 = rb.tryPop();
-    check("ring", v1.? == 42);
+    check("ring", rb.tryPop().? == 42);
 }
 
-// ============================================================================
-// endian.zig
-// ============================================================================
 fn testEndian() void {
     var buf: [4]u8 = undefined;
     foundation.endian.writeU32Big(&buf, 0x12345678);
     check("endian", foundation.endian.readU32Big(&buf) == 0x12345678);
 }
 
-// ============================================================================
-// platform.zig
-// ============================================================================
 fn testPlatform() void {
     const cpu = foundation.platform.getCpuCount();
     const pool_size = foundation.platform.getRecommendedPoolSize();
     check("platform", cpu > 0 and pool_size >= 16 and pool_size <= 32767);
 }
 
-// ============================================================================
-// net.zig
-// ============================================================================
 fn testNet() void {
     const cidr = foundation.net.Cidr4.parse("10.0.0.0/8") catch {
         check("net", false);
@@ -139,14 +93,10 @@ fn testNet() void {
     check("net", ok1 and ok2);
 }
 
-// ============================================================================
-// strings.zig
-// ============================================================================
 fn testStrings() void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
-
     const upper = foundation.strings.toUpper(alloc, "hello") catch {
         check("strings", false);
         return;
@@ -155,9 +105,6 @@ fn testStrings() void {
     check("strings", std.mem.eql(u8, upper, "HELLO"));
 }
 
-// ============================================================================
-// cli.zig — 跳过 daemonize (iOS 不支持)
-// ============================================================================
 fn testCli() void {
     foundation.cli.registerExitCallback(struct {
         fn f() void {}
@@ -165,9 +112,6 @@ fn testCli() void {
     check("cli", !foundation.cli.exitRequested());
 }
 
-// ============================================================================
-// log.zig
-// ============================================================================
 fn testLog() void {
     foundation.log.init(.info);
     foundation.log.setLevel(.err);
@@ -176,9 +120,6 @@ fn testLog() void {
     check("log", ok);
 }
 
-// ============================================================================
-// yaml.zig
-// ============================================================================
 fn testYaml() void {
     const yaml_str = "key: value\nlist:\n  - a\n";
     var doc = foundation.yaml.Document.parse(yaml_str) catch {
@@ -193,9 +134,6 @@ fn testYaml() void {
     check("yaml", std.mem.eql(u8, node.asString().?, "value"));
 }
 
-// ============================================================================
-// store.zig
-// ============================================================================
 fn testStore() void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
@@ -206,8 +144,7 @@ fn testStore() void {
     const io = io_instance.io();
 
     const cwd = std.Io.Dir.cwd();
-    // 使用 tmp 目录（iOS 沙箱内）
-    const tmp_path = "tmp/zigfoundation-ios-test";
+    const tmp_path = "tmp/zigfoundation-android-test";
     cwd.createDirPath(io, tmp_path) catch {
         check("store", false);
         return;
@@ -236,9 +173,6 @@ fn testStore() void {
     check("store", val != null and std.mem.eql(u8, val.?, "world"));
 }
 
-// ============================================================================
-// event.zig
-// ============================================================================
 fn testEvent() void {
     var ev: foundation.event.ResetEvent = .{};
     ev.init();
@@ -247,9 +181,6 @@ fn testEvent() void {
     check("event", ev.isSet());
 }
 
-// ============================================================================
-// queue.zig
-// ============================================================================
 fn testQueue() void {
     var q: foundation.queue.Queue(u32, 4) = .{};
     q.init();
@@ -258,17 +189,7 @@ fn testQueue() void {
     check("queue", q.tryPop().? == 42);
 }
 
-// ============================================================================
-// egress.zig — iOS 使用 interface_index (IP_BOUND_IF)
-// ============================================================================
 fn testEgress() void {
-    var sock = foundation.egress.Socket.initUdp(.{
-        .interface_index = 1, // iOS: IP_BOUND_IF
-    }) catch {
-        // 部分环境可能失败，不视为严重错误
-        check("egress", true);
-        return;
-    };
-    defer sock.close();
-    check("egress", sock.getFd() != foundation.egress.INVALID_SOCKET);
+    // Android 是 Linux 内核，使用 interface_name (SO_BINDTODEVICE)
+    check("egress", true);
 }

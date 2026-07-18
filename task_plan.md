@@ -96,6 +96,41 @@ Phase 6 (集成验证)
 - [x] Windows VM 测试：13/13 passed ✅（egress 崩溃已修复）
 - **Status:** complete
 
+### Phase 6c: vendor/yaml 重构 — 独立 Zig package
+- [x] 将 libyaml C 编译代码从根 `build.zig` 提取到 `vendor/yaml/build.zig`
+- [x] 创建 `vendor/yaml/build.zig.zon`（Zig package manifest）
+- [x] 创建 `vendor/yaml/yaml_c.zig`（C 绑定重导出入口）
+- [x] 根 `build.zig.zon` 添加 `.yaml = .{ .path = "vendor/yaml" }` 依赖声明
+- [x] 根 `build.zig`：`b.dependency("yaml", .{}).module("yaml_c")` 替代内联 C 编译
+- [x] 根 `build.zig` 简化：~200行 → ~130行（移除 translate-c + addCSourceFiles + include paths ~55行）
+- [x] 关键修复：`vendor/yaml/build.zig` 使用 `b.addModule("yaml_c", ...)` (public) 而非 `b.createModule(...)` (private)
+- [x] `CLAUDE.md` 新增「Vendored C 库模式」章节（addModule vs createModule 区别）
+- [x] 原生验证：`zig build test` 173/173 ✅
+- **Status:** complete
+
+### Phase 6d: 交叉编译修复 — vendor/yaml 的 sysroot include
+- [x] 问题：重构后 iOS/Android 交叉编译失败 — vendor/yaml C 文件找不到 `stdlib.h` / `asm/types.h`
+- [x] 根因：`b.sysroot` 全局传播只影响 linker，不影响 dependency 内 C 编译的 include path
+- [x] 修复：`vendor/yaml/build.zig` 添加 sysroot `usr/include`（iOS/Android 通用）
+- [x] 修复：添加 NDK 架构特定 `usr/include/<triple>/`（Android `asm/types.h` 等内核头）
+- [x] 方案：预设常见 Android 架构目录列表（aarch64/arm/x86_64/i686），不存在的路径 clang 仅警告
+- [x] iOS 验证：`aarch64-ios` 真机 + `aarch64-ios-simulator` 均编译成功
+- [x] Android 验证：`aarch64-linux-android` .so (3.7MB) 编译成功
+- **Status:** complete
+
+### Phase 6e: Android ARM64 模拟器真机测试
+- [x] 创建 `ndk-libc.conf` — Zig 0.16.0 NDK Bionic libc 配置文件（全部 6 字段）
+- [x] NDK 库文件 symlink 修复：.so/.a 从 `<triple>/<api>/` 子目录链接到父目录
+- [x] 问题发现：NDK 30 `libc.a` 包含 Rust std 对象需要 `_Unwind_*` 符号 → 无法静态链接
+- [x] 修复：`build.zig` `android-test` 使用 `.linkage = .dynamic` 动态链接
+- [x] 问题修复：`linkSystemLibrary("log")` 无法在 NDK 中定位 → `src/log.zig` Android 改用 stderr
+- [x] Android 原生程序 stderr 自动输出到 logcat，无需 `__android_log_write`
+- [x] 窗口模式：`build-and-run.sh` 默认不传 `-no-window`，模拟器 GUI 可见
+- [x] `testLog()` 日志级别恢复修复：iOS + Android test_runner 都修复（`setLevel(.info)` 在测试末尾）
+- [x] Android 模拟器测试：**13/13 模块全部 PASS**（Pixel 9 ARM64 API 36.1 模拟器）
+- [x] 创建 Memory：`android-cross-compilation-with-zig.md` + `test-log-level-restore.md`
+- **Status:** complete
+
 ## Key Questions
 1. ring.zig 选 zigproxy 简化版 (199行) 还是 zproxy 完整版 (602行)？后者含跨平台同步原语
 2. endian 封装粒度：只封 readInt 还是连 writeInt 一起？

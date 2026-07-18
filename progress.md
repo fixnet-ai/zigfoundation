@@ -253,19 +253,105 @@
   - `std.posix.setsockopt` Windows 上 `@compileError("use std.Io")` → `sockSetOpt` 跨平台 wrapper
   - `std.c.socket()` 返回 `-1`→`@intCast` to `usize` panic → 先检查 `raw < 0`
 
+### Phase 6c: vendor/yaml 重构 — 独立 Zig package
+- **Status:** complete
+- Actions taken:
+  - 将 libyaml C 编译代码从根 `build.zig` 提取到 `vendor/yaml/build.zig`（~55行）
+  - 创建 `vendor/yaml/build.zig.zon`（Zig package manifest: .name=.yaml, .fingerprint=0xea31a98470f68690）
+  - 创建 `vendor/yaml/yaml_c.zig`（C 绑定重导出：yaml_document_t/yaml_parser_t 等 16 个符号）
+  - 根 `build.zig.zon` 添加 `.yaml = .{ .path = "vendor/yaml" }` 依赖声明
+  - 根 `build.zig` 简化：~200行 → ~130行（移除 translate-c + addCSourceFiles + include paths）
+  - 关键修复：`vendor/yaml/build.zig` 使用 `b.addModule("yaml_c", ...)` (public) 而非 `b.createModule(...)` (private)
+  - `CLAUDE.md` 新增「Vendored C 库模式」章节（addModule vs createModule 区别）
+  - 原生验证：`zig build test` 173/173 ✅
+- Files created/modified:
+  - vendor/yaml/build.zig (created — package build script)
+  - vendor/yaml/build.zig.zon (created — package manifest)
+  - vendor/yaml/yaml_c.zig (created — C binding re-exports)
+  - build.zig (modified — simplified from ~200 to ~130 lines)
+  - build.zig.zon (modified — added .yaml dependency)
+  - CLAUDE.md (updated — Vendored C 库模式)
+- Errors encountered:
+  - `b.createModule()` 创建私有模块 → 依赖方 `dep.module("yaml_c")` 找不到 → 改用 `b.addModule("name", opts)` (公开)
+  - `build.zig.zon` 缺少 `fingerprint` 字段 → 添加 `0xea31a98470f68690`
+
+### Phase 6d: 交叉编译修复 — vendor/yaml 的 sysroot include
+- **Status:** complete
+- Actions taken:
+  - 问题：Phase 6c 重构后 iOS/Android 交叉编译失败 — vendor/yaml C 文件找不到 `stdlib.h` / `asm/types.h`
+  - 根因：`b.sysroot` 全局传播只影响 linker，不影响 dependency 内 C 编译的 include path
+  - 修复 `vendor/yaml/build.zig`：添加 sysroot `usr/include`（解决 iOS `stdlib.h` 找不到）
+  - 修复 `vendor/yaml/build.zig`：添加 NDK 架构特定 `usr/include/<triple>/`（解决 Android `asm/types.h` 找不到）
+  - 方案：预设常见 Android 架构目录列表（aarch64/arm/x86_64/i686），不存在的路径 clang 仅警告
+  - iOS 验证：`aarch64-ios` 真机 + `aarch64-ios-simulator` 均编译成功，.a 5.8MB
+  - Android 验证：`aarch64-linux-android` .so 3.7MB (ELF ARM aarch64) 编译成功
+  - 全量回归：`zig build test` 173/173 ✅
+  - GitHub MCP 插件安装 + `GITHUB_PERSONAL_ACCESS_TOKEN` 配置 → `~/.bash_profile`
+- Files created/modified:
+  - vendor/yaml/build.zig (modified — sysroot include + NDK arch-specific includes)
+  - ~/.bash_profile (modified — added GITHUB_PERSONAL_ACCESS_TOKEN)
+- Errors encountered:
+  - `stdlib.h` not found (iOS) → `vendor/yaml/build.zig` 添加 `yaml_c_mod.addSystemIncludePath` for `b.sysroot + "/usr/include"`
+  - `asm/types.h` not found (Android) → NDK kernel headers 在 `usr/include/<triple>/asm/`，需额外 addSystemIncludePath
+  - `target.result.zigTriple()` 在 dependency 中返回宿主 triple 而非目标 triple → 改用预设架构目录列表
+  - `catch break` 不支持 while 循环 → 改用 `while (true) { ... catch break; }`
+  - `std.fs.openDirAbsolute` 不存在 (Zig 0.16.0) → `std.Io.Dir.openDirAbsolute` 需 Io 参数 → 最终放弃目录扫描
+
+### Phase 6e: Android ARM64 模拟器真机测试
+- **Status:** complete
+- Actions taken:
+  - 创建 `ndk-libc.conf` — Zig 0.16.0 NDK Bionic libc 配置（全部 6 字段：include_dir / sys_include_dir / crt_dir / msvc_lib_dir / kernel32_lib_dir / gcc_dir）
+  - 创建 NDK 库文件 symlink：libc.so/libm.so/libdl.so → `36/<lib>.so`（linker 需要父目录找到库）
+  - 问题发现：NDK 30 `libc.a` 包含 Rust std 对象需要 `_Unwind_*` 符号，无法静态链接
+  - 修复：`build.zig` `android-test` 使用 `.linkage = .dynamic` 动态链接（Zig 自动设置 `/system/bin/linker64` 解释器）
+  - 修复：`b.addModule("android_test_mod")` → `android_test_mod.addImport("foundation", lib_module)` 组装最终模块
+  - 问题修复：`linkSystemLibrary("log")` Zig 构建系统无法在 NDK 中定位 liblog
+  - 修复：`src/log.zig` 移除 `__android_log_write` + `extern fn` → Android 直接走 stderr（原生程序 stderr 自动输出到 logcat）
+  - 创建 `examples/android/build-and-run.sh` — 全自动构建→启动模拟器→推送→运行脚本，默认窗口模式
+  - 日志级别恢复修复：`testLog()` 末尾添加 `setLevel(.info)` — iOS 和 Android test_runner 均修复，否则后续 PASS 不可见
+  - Android 模拟器测试：13/13 模块全部 PASS（Pixel 9 ARM64 API 36.1 模拟器，动态执行文件推送到 `/data/local/tmp/`，adb shell 运行）
+  - 全量回归：`zig build test` 173/173 ✅ + CLI 13/13 ✅
+  - 创建 Memory 文件：`android-cross-compilation-with-zig.md` (NDK 配置参考) + `test-log-level-restore.md` (日志级别恢复模式)
+- Files created/modified:
+  - ndk-libc.conf (created)
+  - build.zig (modified — android-test executable build step, dynamic linkage)
+  - src/log.zig (modified — removed __android_log_write, Android uses stderr)
+  - examples/android/test_runner.zig (created — already existed, fixed testLog)
+  - examples/android/build-and-run.sh (created)
+  - examples/ios/main.zig (modified — testLog level restore)
+  - ~/.claude/projects/.../memory/android-cross-compilation-with-zig.md (created)
+  - ~/.claude/projects/.../memory/test-log-level-restore.md (created)
+  - ~/.claude/projects/.../memory/MEMORY.md (updated)
+- Errors encountered:
+  - libc conf parse error `missing field: msvc_lib_dir` → Zig 0.16.0 要求 ALL 6 字段全部出现，空值也要声明
+  - `ld.lld: unable to find library -lm -lc -ldl` → NDK 库在版本化子目录，需创建 symlink
+  - NDK 30 `libc.a` 含 Rust std → 改用 `.linkage = .dynamic`
+  - `addLibraryPath` 路径被 sysroot 加倍 → 最终避开（动态链接不需要额外 -L）
+  - `testLog()` 永久改变全局日志级别 → 测试末尾恢复 `.info`
+
+### Infrastructure: GitHub MCP 插件
+- **Status:** complete
+- Actions taken:
+  - 安装 GitHub MCP 插件（HTTP server: `api.githubcopilot.com/mcp/`）
+  - 配置 `GITHUB_PERSONAL_ACCESS_TOKEN`：从 `gh auth token` 获取 → `~/.bash_profile` export
+- Files modified:
+  - ~/.bash_profile (added GITHUB_PERSONAL_ACCESS_TOKEN export)
+
 ## Error Log
 | Timestamp | Error | Attempt | Resolution |
 |-----------|-------|---------|------------|
 | 2026-07-19 | Windows @intCast(-1)→usize panic | 1 | 在 Windows 分支 @intCast 前添加 `if (raw < 0) return error.SocketCreateFailed` |
+| 2026-07-19 | NDK 30 libc.a 含 Rust std (Unwind 符号缺失) | 2 | 改用 `.linkage = .dynamic` 动态链接 |
+| 2026-07-19 | testLog() 抑制后续所有 PASS 输出 | 1 | testLog 末尾恢复 `.info` 级别；ios + android test_runner 均修复 |
 
 ## 5-Question Reboot Check
 | Question | Answer |
 |----------|--------|
-| 我在哪里？ | Phase 6 完成 — 13 模块全部实现，三平台示例就绪 |
+| 我在哪里？ | Phase 6e 完成 — Android ARM64 模拟器真机测试 13/13 全绿；173/173 测试全绿 |
 | 我要去哪里？ | 后续：兄弟项目适配 Zig 0.16.0 后的集成验证；持续维护 |
 | 目标是什么？ | 实现 13 个工业级基础模块，100% 测试覆盖，五平台 — 已达成 |
-| 我学到了什么？ | Zig 0.16.0 Io API 全面重写：File.Writer≠Io.Writer 不同类型→需手动构造 VTable；GeneralPurposeAllocator 移除→ArenaAllocator；cstr.addNullByte 移除→手动分配；Io.Limit 改为 enum；android os.tag 不存在→用 abi.isAndroid() |
-| 我做了什么？ | Phase 6：3 个示例程序 (CLI/iOS/Android)、5 个源文件修改 (build.zig/cli.zig/log.zig/egress.zig)、12 个新文件创建；173/173 测试全绿；CLI 示例桌面运行通过 |
+| 我学到了什么？ | 1) Zig 0.16.0 libc conf 要求全部 6 字段；2) NDK 30 libc.a 含 Rust std → 必须动态链接；3) Android 原生程序 stderr 自动到 logcat；4) 日志级别是全局状态，testLog 必须恢复；5) addModule=公开模块、createModule=私有模块；6) b.sysroot 不自动传播到 dependency C 编译 include path |
+| 我做了什么？ | Phase 6e: Android ARM64 模拟器真机测试（动态执行文件 + logcat 输出）+ 日志级别恢复修复 + Memory + 文档更新 |
 
 ---
 *每个阶段完成或遇到错误后更新此文件*

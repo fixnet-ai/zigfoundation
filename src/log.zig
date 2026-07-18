@@ -1,8 +1,8 @@
 //! 跨平台分级日志框架 — 基于 std.log 集成
 //!
 //! 平台适配：
-//! - Android: __android_log_write (logcat)
-//! - iOS / macOS: syslog
+//! - Android: stderr（原生程序 stderr 输出到 logcat）
+//! - iOS / macOS: stderr
 //! - Linux / Windows: stderr (ANSI 颜色)
 //!
 //! 通过 `std_options.logFn` 覆盖 std.log 的默认行为，
@@ -98,9 +98,9 @@ fn platformWrite(
         "";
     defer if (prefix.len > 0) std.heap.page_allocator.free(prefix);
 
-    if (builtin.abi.isAndroid()) {
-        androidLog(level, prefix, msg);
-    } else switch (builtin.os.tag) {
+    // Android 原生程序 stderr 也会输出到 logcat，无需单独调用 __android_log_write
+    _ = .{ level, prefix, msg };
+    switch (builtin.os.tag) {
         .ios, .macos, .tvos, .watchos => darwinLog(level, prefix, msg),
         .linux, .windows => desktopLog(level, prefix, msg),
         else => desktopLog(level, prefix, msg),
@@ -108,55 +108,23 @@ fn platformWrite(
 }
 
 // ============================================================
-// Android — logcat
-// ============================================================
-
-fn androidLog(level: Level, prefix: []const u8, msg: []const u8) void {
-    const combined = std.fmt.allocPrint(std.heap.page_allocator, "{s}{s}", .{ prefix, msg }) catch return;
-    defer std.heap.page_allocator.free(combined);
-
-    const c_str = std.heap.page_allocator.alloc(u8, combined.len + 1) catch return;
-    defer std.heap.page_allocator.free(c_str);
-    @memcpy(c_str[0..combined.len], combined);
-    c_str[combined.len] = 0;
-
-    const priority: c_int = switch (level) {
-        .err => 3, // ANDROID_LOG_ERROR
-        .warn => 4, // ANDROID_LOG_WARN
-        .info => 5, // ANDROID_LOG_INFO
-        .debug => 6, // ANDROID_LOG_DEBUG
-    };
-
-    _ = __android_log_write(priority, "zigfoundation", c_str.ptr);
-}
-
-extern fn __android_log_write(prio: c_int, tag: [*]const u8, text: [*]const u8) c_int;
-
-// ============================================================
-// iOS / macOS — syslog
+// Darwin (iOS / macOS) — stderr
 // ============================================================
 
 fn darwinLog(level: Level, prefix: []const u8, msg: []const u8) void {
-    const combined = std.fmt.allocPrint(std.heap.page_allocator, "{s}{s}", .{ prefix, msg }) catch return;
-    defer std.heap.page_allocator.free(combined);
-
-    // 分配 null-terminated C 字符串
-    const c_str = std.heap.page_allocator.alloc(u8, combined.len + 1) catch return;
-    defer std.heap.page_allocator.free(c_str);
-    @memcpy(c_str[0..combined.len], combined);
-    c_str[combined.len] = 0;
-
-    const priority: c_int = switch (level) {
-        .err => 3, // LOG_ERR
-        .warn => 4, // LOG_WARNING
-        .info => 6, // LOG_INFO
-        .debug => 7, // LOG_DEBUG
+    const color = switch (level) {
+        .err => "\x1b[31m",
+        .warn => "\x1b[33m",
+        .info => "\x1b[32m",
+        .debug => "\x1b[36m",
     };
+    const reset = "\x1b[0m";
 
-    _ = syslog(priority, "%s", c_str.ptr);
+    const line = std.fmt.allocPrint(std.heap.page_allocator, "zigfoundation: {s}{s}{s}{s}\n", .{ color, prefix, msg, reset }) catch return;
+    defer std.heap.page_allocator.free(line);
+
+    _ = std.c.write(2, line.ptr, line.len);
 }
-
-extern fn syslog(priority: c_int, format: [*]const u8, ...) void;
 
 // ============================================================
 // 桌面 — stderr（ANSI 颜色）
