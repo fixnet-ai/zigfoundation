@@ -26,3 +26,7 @@ zig-pkg/
 
 # Windows
 Desktop.ini
+
+# Playwright MCP temp files
+.playwright-mcp/
+test_ios

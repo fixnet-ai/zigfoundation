@@ -98,8 +98,9 @@ fn platformWrite(
         "";
     defer if (prefix.len > 0) std.heap.page_allocator.free(prefix);
 
-    switch (builtin.os.tag) {
-        .android => androidLog(level, prefix, msg),
+    if (builtin.abi.isAndroid()) {
+        androidLog(level, prefix, msg);
+    } else switch (builtin.os.tag) {
         .ios, .macos, .tvos, .watchos => darwinLog(level, prefix, msg),
         .linux, .windows => desktopLog(level, prefix, msg),
         else => desktopLog(level, prefix, msg),
@@ -114,8 +115,10 @@ fn androidLog(level: Level, prefix: []const u8, msg: []const u8) void {
     const combined = std.fmt.allocPrint(std.heap.page_allocator, "{s}{s}", .{ prefix, msg }) catch return;
     defer std.heap.page_allocator.free(combined);
 
-    const c_str = std.cstr.addNullByte(std.heap.page_allocator, combined) catch return;
+    const c_str = std.heap.page_allocator.alloc(u8, combined.len + 1) catch return;
     defer std.heap.page_allocator.free(c_str);
+    @memcpy(c_str[0..combined.len], combined);
+    c_str[combined.len] = 0;
 
     const priority: c_int = switch (level) {
         .err => 3, // ANDROID_LOG_ERROR
@@ -124,7 +127,7 @@ fn androidLog(level: Level, prefix: []const u8, msg: []const u8) void {
         .debug => 6, // ANDROID_LOG_DEBUG
     };
 
-    _ = __android_log_write(priority, "zigfoundation", c_str);
+    _ = __android_log_write(priority, "zigfoundation", c_str.ptr);
 }
 
 extern fn __android_log_write(prio: c_int, tag: [*]const u8, text: [*]const u8) c_int;
@@ -137,8 +140,11 @@ fn darwinLog(level: Level, prefix: []const u8, msg: []const u8) void {
     const combined = std.fmt.allocPrint(std.heap.page_allocator, "{s}{s}", .{ prefix, msg }) catch return;
     defer std.heap.page_allocator.free(combined);
 
-    const c_str = std.cstr.addNullByte(std.heap.page_allocator, combined) catch return;
+    // 分配 null-terminated C 字符串
+    const c_str = std.heap.page_allocator.alloc(u8, combined.len + 1) catch return;
     defer std.heap.page_allocator.free(c_str);
+    @memcpy(c_str[0..combined.len], combined);
+    c_str[combined.len] = 0;
 
     const priority: c_int = switch (level) {
         .err => 3, // LOG_ERR
@@ -168,7 +174,35 @@ fn desktopLog(level: Level, prefix: []const u8, msg: []const u8) void {
     const line = std.fmt.allocPrint(std.heap.page_allocator, "{s}{s}{s}{s}\n", .{ color, prefix, msg, reset }) catch return;
     defer std.heap.page_allocator.free(line);
 
-    _ = std.c.write(2, line.ptr, line.len);
+    if (builtin.os.tag == .windows) {
+        const stderr_h = logWinGetStdHandle(logWin.STD_ERROR_HANDLE);
+        _ = logWin.WriteFile(stderr_h, line.ptr, @intCast(line.len), null, null);
+    } else {
+        _ = std.c.write(2, line.ptr, line.len);
+    }
+}
+
+// Windows I/O — declared locally since Zig 0.16.0 has minimal kernel32 in std lib.
+const logWin = struct {
+    const HANDLE = *anyopaque;
+    const DWORD = u32;
+    const BOOL = i32;
+    const LPVOID = *anyopaque;
+
+    const STD_ERROR_HANDLE: DWORD = @as(DWORD, @bitCast(@as(i32, -12)));
+
+    extern "kernel32" fn GetStdHandle(nStdHandle: DWORD) callconv(.winapi) HANDLE;
+    extern "kernel32" fn WriteFile(
+        hFile: HANDLE,
+        lpBuffer: [*]const u8,
+        nNumberOfBytesToWrite: DWORD,
+        lpNumberOfBytesWritten: ?*DWORD,
+        lpOverlapped: ?LPVOID,
+    ) callconv(.winapi) BOOL;
+};
+
+fn logWinGetStdHandle(which: logWin.DWORD) logWin.HANDLE {
+    return logWin.GetStdHandle(which);
 }
 
 // ============================================================

@@ -22,7 +22,26 @@
 //! - `len()` 仅返回快照值，调用后可能立即变化
 
 const std = @import("std");
+const builtin = @import("builtin");
 const event_mod = @import("event.zig");
+
+/// 跨平台互斥锁 — POSIX 使用 pthread_mutex_t，Windows 使用原子自旋锁。
+const Mutex = if (builtin.os.tag == .windows)
+    struct {
+        locked: bool = false,
+
+        fn lock(self: *@This()) void {
+            while (@atomicRmw(bool, &self.locked, .Xchg, true, .acquire)) {
+                std.atomic.spinLoopHint();
+            }
+        }
+
+        fn unlock(self: *@This()) void {
+            @atomicStore(bool, &self.locked, false, .release);
+        }
+    }
+else
+    std.c.pthread_mutex_t;
 
 /// 返回固定容量环形缓冲区队列的类型。
 ///
@@ -30,7 +49,7 @@ const event_mod = @import("event.zig");
 /// 生产者-消费者模式：一个生产者线程 + 一个消费者线程。
 pub fn Queue(comptime T: type, comptime capacity: usize) type {
     return struct {
-        mutex: std.c.pthread_mutex_t = .{},
+        mutex: Mutex = .{},
         event: event_mod.ResetEvent = .{},
         buffer: [capacity]T = undefined,
         head: usize = 0,
@@ -39,7 +58,7 @@ pub fn Queue(comptime T: type, comptime capacity: usize) type {
 
         const Self = @This();
 
-        /// Zig 0.16.0 不在 std.c 中导出 pthread_mutex_init / pthread_mutex_destroy。
+        /// Zig 0.16.0 不在 std.c 中导出 pthread_mutex_init / pthread_mutex_destroy（仅 POSIX 需要）。
         extern "c" fn pthread_mutex_init(
             mutex: *std.c.pthread_mutex_t,
             attr: ?*const anyopaque,
@@ -48,20 +67,40 @@ pub fn Queue(comptime T: type, comptime capacity: usize) type {
 
         /// 初始化 mutex 和 event。首次使用前必须调用。
         pub fn init(self: *Self) void {
-            _ = pthread_mutex_init(&self.mutex, null);
+            if (builtin.os.tag != .windows) {
+                _ = pthread_mutex_init(&self.mutex, null);
+            }
             self.event.init();
         }
 
         /// 销毁 mutex 和 event。在 `init()` 之后仅调用一次。
         pub fn deinit(self: *Self) void {
             self.event.deinit();
-            _ = pthread_mutex_destroy(&self.mutex);
+            if (builtin.os.tag != .windows) {
+                _ = pthread_mutex_destroy(&self.mutex);
+            }
+        }
+
+        fn lockMutex(self: *Self) void {
+            if (builtin.os.tag == .windows) {
+                self.mutex.lock();
+            } else {
+                _ = std.c.pthread_mutex_lock(&self.mutex);
+            }
+        }
+
+        fn unlockMutex(self: *Self) void {
+            if (builtin.os.tag == .windows) {
+                self.mutex.unlock();
+            } else {
+                _ = std.c.pthread_mutex_unlock(&self.mutex);
+            }
         }
 
         /// 入队 `item`。如果队列已满，最旧的条目被覆盖（丢弃）。
         /// 始终通过 `event.set()` 唤醒消费者。
         pub fn push(self: *Self, item: T) void {
-            _ = std.c.pthread_mutex_lock(&self.mutex);
+            self.lockMutex();
             if (self.count < capacity) {
                 self.buffer[self.tail] = item;
                 self.tail = (self.tail + 1) % capacity;
@@ -71,15 +110,15 @@ pub fn Queue(comptime T: type, comptime capacity: usize) type {
                 self.buffer[self.head] = item;
                 self.head = (self.head + 1) % capacity;
             }
-            _ = std.c.pthread_mutex_unlock(&self.mutex);
+            self.unlockMutex();
             self.event.set();
         }
 
         /// FIFO 出队。队列空时返回 `null`。
         /// 队列排空时重置 event，使下一次 `wait()` 阻塞直到下一次 `push()`。
         pub fn tryPop(self: *Self) ?T {
-            _ = std.c.pthread_mutex_lock(&self.mutex);
-            defer _ = std.c.pthread_mutex_unlock(&self.mutex);
+            self.lockMutex();
+            defer self.unlockMutex();
             if (self.count == 0) return null;
             const item = self.buffer[self.head];
             self.head = (self.head + 1) % capacity;
@@ -93,8 +132,8 @@ pub fn Queue(comptime T: type, comptime capacity: usize) type {
         /// 队列排空时重置 event。
         pub fn drain(self: *Self, out: []T) usize {
             if (out.len == 0) return 0;
-            _ = std.c.pthread_mutex_lock(&self.mutex);
-            defer _ = std.c.pthread_mutex_unlock(&self.mutex);
+            self.lockMutex();
+            defer self.unlockMutex();
             const n = @min(self.count, out.len);
             for (out[0..n]) |*slot| {
                 slot.* = self.buffer[self.head];

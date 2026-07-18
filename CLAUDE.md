@@ -70,6 +70,40 @@ zig build test-build         # 编译测试二进制（交叉编译用）
 zig fetch --save=zli <url>   # 更新 zli 依赖版本（仅在升级 zli 时需要）
 ```
 
+### 示例程序构建
+
+```bash
+# 桌面 CLI 集成测试 (macOS/Linux/Windows)
+zig build example-cli
+./zig-out/bin/zigfoundation-example-cli
+
+# iOS 模拟器静态库 (需 Xcode + IOS_SDK_HOME 环境变量)
+zig build example-ios -Dtarget=aarch64-ios-simulator -Dsysroot="$IOS_SDK_HOME"
+# → zig-out/lib/libzigfoundation-example-ios.a
+# 或直接运行: examples/ios/build.sh
+
+# Android 模拟器共享库 (需 Android NDK + ANDROID_NDK_HOME 环境变量)
+# 先运行: examples/android/build.sh  (自动生成 libc.conf + 构建)
+# 手动: zig build example-android -Dtarget=aarch64-linux-android \
+#          -Dsysroot="$ANDROID_NDK_HOME/.../sysroot" -Dlibc-file=<libc.conf>
+# → zig-out/lib/libzigfoundation-example-android.so
+```
+
+### 交叉编译环境变量
+
+在 `~/.bash_profile` 中设置：
+
+```bash
+export IOS_SDK_HOME=$(xcrun --sdk iphonesimulator --show-sdk-path 2>/dev/null)
+export ANDROID_HOME="$HOME/Library/Android/sdk"
+export ANDROID_SDK_ROOT="$ANDROID_HOME"
+export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/30.0.15729638"
+```
+
+build.zig 通过 `-Dsysroot=<path>` 和 `-Dlibc-file=<path>` 选项接收这些路径：
+- `-Dsysroot` — 设置 `b.sysroot`（linker 用）+ `addSystemIncludePath`（C 编译器用）+ 架构特定头文件路径
+- `-Dlibc-file` — Android 专属，指向 NDK Bionic libc 配置文件（格式：key=value，字段见 std/zig/LibCInstallation.zig）
+
 ## 模块架构
 
 ### 依赖分层

@@ -129,22 +129,52 @@ pub const Socket = struct {
 };
 
 /// 无效 socket 值（POSIX: -1, Windows: ~0）。
-const INVALID_SOCKET = if (builtin.os.tag == .windows)
-    @as(std.posix.socket_t, @bitCast(@as(c_ulong, std.math.maxInt(c_ulong))))
+pub const INVALID_SOCKET = if (builtin.os.tag == .windows)
+    @as(std.posix.socket_t, @ptrFromInt(@as(usize, std.math.maxInt(usize))))
 else
     @as(std.posix.socket_t, -1);
 
 /// 跨平台 socket() 封装。
 fn createSocket(domain: u32, sock_type: u32, protocol: u32) !std.posix.socket_t {
-    const fd = std.c.socket(domain, sock_type, protocol);
-    if (fd == INVALID_SOCKET) return error.SocketCreateFailed;
-    return fd;
+    const raw = std.c.socket(domain, sock_type, protocol);
+    if (builtin.os.tag == .windows) {
+        // raw 是 c_int (i32)，失败时返回 -1。必须先检查再 @intCast 到 usize，
+        // 否则负数无法转换为无符号类型导致 panic。
+        if (raw < 0) return error.SocketCreateFailed;
+        return @ptrFromInt(@as(usize, @intCast(raw)));
+    } else {
+        if (raw == INVALID_SOCKET) return error.SocketCreateFailed;
+        return raw;
+    }
 }
 
 /// 跨平台 close() 封装。
 fn closeFd(fd: std.posix.socket_t) void {
-    _ = std.c.close(fd);
+    if (builtin.os.tag == .windows) {
+        _ = winSock.closesocket(@intFromPtr(fd));
+    } else {
+        _ = std.c.close(fd);
+    }
 }
+
+/// 设置 IPV6_V6ONLY（false = 双栈模式）。
+fn setIpv6Only(fd: std.posix.socket_t, ipv6_only: bool) !void {
+    const val: u32 = if (ipv6_only) 1 else 0;
+    try sockSetOpt(fd, IPPROTO_IPV6, IPV6_V6ONLY, std.mem.asBytes(&val));
+}
+
+// Windows winsock helpers — declared locally since Zig 0.16.0 has minimal ws2_32 coverage.
+const winSock = struct {
+    const SOCKET = usize;
+    extern "ws2_32" fn setsockopt(
+        s: SOCKET,
+        level: c_int,
+        optname: c_int,
+        optval: [*]const u8,
+        optlen: c_int,
+    ) callconv(.winapi) c_int;
+    extern "ws2_32" fn closesocket(s: SOCKET) callconv(.winapi) c_int;
+};
 
 /// 应用 BindOpts 到 socket fd。
 fn applyOpts(fd: std.posix.socket_t, opts: BindOpts, is_ipv6: bool) !void {
@@ -165,10 +195,21 @@ fn applyOpts(fd: std.posix.socket_t, opts: BindOpts, is_ipv6: bool) !void {
     }
 }
 
+/// 跨平台 setsockopt 封装 — POSIX 使用 std.posix，Windows 使用 winsock。
+fn sockSetOpt(fd: std.posix.socket_t, level: i32, optname: u32, opt: []const u8) !void {
+    if (builtin.os.tag == .windows) {
+        const sock: winSock.SOCKET = @intFromPtr(fd);
+        const rc = winSock.setsockopt(sock, level, @intCast(optname), opt.ptr, @intCast(opt.len));
+        if (rc != 0) return error.SetSockOptFailed;
+    } else {
+        try std.posix.setsockopt(fd, level, optname, opt);
+    }
+}
+
 /// 设置 SO_REUSEADDR（全平台）。
 fn setReuseAddr(fd: std.posix.socket_t) !void {
     const on: u32 = 1;
-    try std.posix.setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, std.mem.asBytes(&on));
+    try sockSetOpt(fd, SOL_SOCKET, SO_REUSEADDR, std.mem.asBytes(&on));
 }
 
 /// Linux: 绑定到指定接口名 (SO_BINDTODEVICE)。
@@ -176,7 +217,7 @@ fn bindToDevice(fd: std.posix.socket_t, ifname: []const u8) !void {
     switch (builtin.os.tag) {
         .linux => {
             const ifname_z = try std.posix.toPosixPath(ifname);
-            try std.posix.setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, ifname_z[0..ifname.len]);
+            try sockSetOpt(fd, SOL_SOCKET, SO_BINDTODEVICE, ifname_z[0..ifname.len]);
         },
         else => return, // 其他平台不支持接口名绑定，静默跳过
     }
@@ -189,10 +230,10 @@ fn bindToInterfaceIndex(fd: std.posix.socket_t, ifindex: u32, is_ipv6: bool) !vo
     const ndx = ifindex;
     switch (builtin.os.tag) {
         .macos, .ios, .tvos, .watchos => {
-            try std.posix.setsockopt(fd, level, IP_BOUND_IF, std.mem.asBytes(&ndx));
+            try sockSetOpt(fd, level, IP_BOUND_IF, std.mem.asBytes(&ndx));
         },
         .windows => {
-            try std.posix.setsockopt(fd, level, IP_UNICAST_IF, std.mem.asBytes(&ndx));
+            try sockSetOpt(fd, level, IP_UNICAST_IF, std.mem.asBytes(&ndx));
         },
         else => return, // 其他平台不支持接口索引绑定，静默跳过
     }
@@ -252,7 +293,7 @@ fn bindSourceAddr(fd: std.posix.socket_t, addr_str: []const u8) !void {
         }
     }
 
-    const rc = std.c.bind(fd, @ptrCast(&sa_bytes), @intCast(sa_len));
+    const rc = std.c.bind(fd, @ptrCast(@alignCast(&sa_bytes)), @intCast(sa_len));
     if (rc != 0) return error.BindFailed;
 }
 
@@ -292,12 +333,6 @@ else
         addr: [16]u8 = [_]u8{0} ** 16,
         scope_id: u32 = 0,
     };
-
-/// 设置 IPV6_V6ONLY（false = 双栈模式）。
-fn setIpv6Only(fd: std.posix.socket_t, ipv6_only: bool) !void {
-    const val: u32 = if (ipv6_only) 1 else 0;
-    try std.posix.setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, std.mem.asBytes(&val));
-}
 
 // ============================================================================
 // 测试

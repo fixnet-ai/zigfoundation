@@ -227,7 +227,7 @@ const testing = std.testing;
 
 test "yaml: parse simple scalar" {
     const content = "hello world";
-    var doc = try Document.parse( content);
+    var doc = try Document.parse(content);
     defer doc.deinit();
 
     const root = doc.root();
@@ -237,7 +237,7 @@ test "yaml: parse simple scalar" {
 
 test "yaml: parse integer" {
     const content = "42";
-    var doc = try Document.parse( content);
+    var doc = try Document.parse(content);
     defer doc.deinit();
 
     const root = doc.root();
@@ -246,7 +246,7 @@ test "yaml: parse integer" {
 
 test "yaml: parse boolean true" {
     const content = "true";
-    var doc = try Document.parse( content);
+    var doc = try Document.parse(content);
     defer doc.deinit();
 
     const root = doc.root();
@@ -255,7 +255,7 @@ test "yaml: parse boolean true" {
 
 test "yaml: parse boolean false" {
     const content = "false";
-    var doc = try Document.parse( content);
+    var doc = try Document.parse(content);
     defer doc.deinit();
 
     const root = doc.root();
@@ -268,7 +268,7 @@ test "yaml: parse sequence" {
         \\- banana
         \\- cherry
     ;
-    var doc = try Document.parse( content);
+    var doc = try Document.parse(content);
     defer doc.deinit();
 
     const root = doc.root();
@@ -287,7 +287,7 @@ test "yaml: parse mapping" {
         \\version: "0.1.0"
         \\active: true
     ;
-    var doc = try Document.parse( content);
+    var doc = try Document.parse(content);
     defer doc.deinit();
 
     const root = doc.root();
@@ -307,7 +307,7 @@ test "yaml: nested mapping and sequence" {
         \\    - example.com
         \\    - test.com
     ;
-    var doc = try Document.parse( content);
+    var doc = try Document.parse(content);
     defer doc.deinit();
 
     const root = doc.root();
@@ -330,7 +330,7 @@ test "yaml: sequence iteration" {
         \\- green
         \\- blue
     ;
-    var doc = try Document.parse( content);
+    var doc = try Document.parse(content);
     defer doc.deinit();
 
     const root = doc.root();
@@ -347,7 +347,7 @@ test "yaml: mapping iteration" {
         \\a: 1
         \\b: 2
     ;
-    var doc = try Document.parse( content);
+    var doc = try Document.parse(content);
     defer doc.deinit();
 
     const root = doc.root();
@@ -361,14 +361,14 @@ test "yaml: mapping iteration" {
 
 test "yaml: parse empty document" {
     const content = "";
-    _ = Document.parse( content) catch |err| {
+    _ = Document.parse(content) catch |err| {
         try testing.expect(err == error.ParseFailed);
     };
 }
 
 test "yaml: seqGet on non-sequence returns null" {
     const content = "scalar";
-    var doc = try Document.parse( content);
+    var doc = try Document.parse(content);
     defer doc.deinit();
 
     const root = doc.root();
@@ -377,7 +377,7 @@ test "yaml: seqGet on non-sequence returns null" {
 
 test "yaml: mappingGet on non-mapping returns null" {
     const content = "scalar";
-    var doc = try Document.parse( content);
+    var doc = try Document.parse(content);
     defer doc.deinit();
 
     const root = doc.root();

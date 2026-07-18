@@ -1035,9 +1035,131 @@ while (i > 0) {
 | `invalid builtin function: '@Type'` | 旧 `@Type(.enum_literal)` | 改用 `@EnumLiteral()` |
 | `enum 'log.Level' has no member named 'trace'` | 使用了 0.16 不存在的级别 | 仅用 err/warn/info/debug |
 | `mutable local not accessible from struct namespace` | comptime 闭包不能捕获运行时可变指针 | 用 struct-level `var` + 工厂函数 |
+| `union 'CallingConvention' has no member named 'C'` | callconv(.C) 已废弃 | export fn 默认为 C convention，移除 callconv |
+| `unable to provide libc for target 'aarch64-linux-android'` | Zig 不捆绑 Bionic libc | 创建 libc 配置文件 + `setLibCFile` |
+| `sub_path is expected to be relative to the build root` | b.path() 不接受绝对路径 | 用 `.{ .cwd_relative = path }` |
+| `@ptrCast increases pointer alignment` | 指针转换时对齐增加 | 添加 `@alignCast` |
+| `expected type '[*]const u8', found '[]u8'` | extern C 函数需要指针 | 用 `.ptr` 取切片指针 |
+| `'asm/types.h' file not found` (Android) | 缺少架构特定 include | 添加 NDK arch 目录 to addSystemIncludePath |
 
 ---
 
-*最后更新: 2026-07-18*
+---
+
+## 13. 交叉编译 (Cross-Compilation)
+
+### 13.1 `CallingConvention` — `.C` 不存在 → `export fn` 默认为 C
+
+Zig 0.16.0 中 `CallingConvention` 是 tagged union，没有 `.C` 成员。
+`export fn` 默认使用目标平台的 C calling convention，无需显式声明：
+
+```zig
+// ❌ 错误: union 'builtin.CallingConvention' has no member named 'C'
+export fn runAllTests() callconv(.C) bool;
+
+// ✅ 正确: export fn 默认为 C calling convention
+export fn runAllTests() bool;
+```
+
+`CallingConvention.c` 是 `pub const`（编译期求值为当前目标的 C 调用约定），不是 tagged union 字段，不能作为 `.c` 枚举字面量使用。
+
+### 13.2 `b.sysroot` — 交叉编译 sysroot 传递
+
+Zig 0.16.0 中 `Build.sysroot` 可设置，Compile 步骤会自动透传 `--sysroot` 给 zig build-lib（用于链接器）。
+C 头文件搜索需要额外 `addSystemIncludePath`：
+
+```zig
+// build.zig
+const sysroot = b.option([]const u8, "sysroot", "sysroot 路径 (iOS SDK / Android NDK)");
+if (sysroot) |s| {
+    b.sysroot = s;  // 设置给 linker
+    // C 编译器头文件搜索需要显式添加
+    const usr_include = b.pathJoin(&.{ s, "usr", "include" });
+    lib_module.addSystemIncludePath(.{ .cwd_relative = usr_include });
+}
+```
+
+注意：`Build.Step.Compile` 没有 `setSysroot` 方法，只能通过 `b.sysroot` 全局设置。
+
+### 13.3 Android NDK 架构特定头文件
+
+Android Bionic 的 `asm/types.h` 等文件不在 `usr/include` 下，而在架构特定目录：
+
+```zig
+// Android NDK 添加架构特定 include path
+const ndk_arch: []const u8 = switch (target.result.cpu.arch) {
+    .aarch64 => "aarch64-linux-android",
+    .x86_64 => "x86_64-linux-android",
+    .x86 => "i686-linux-android",
+    .arm, .armeb, .thumb, .thumbeb => "arm-linux-androideabi",
+    .riscv64 => "riscv64-linux-android",
+    else => "aarch64-linux-android",
+};
+const arch_include = b.pathJoin(&.{ s, "usr", "include", ndk_arch });
+lib_module.addSystemIncludePath(.{ .cwd_relative = arch_include });
+```
+
+### 13.4 `--libc` 文件 — Zig 不捆绑 Bionic 时的方案
+
+Zig 0.16.0 不捆绑 Android Bionic libc。需创建 libc 配置文件并通过 `setLibCFile` 传递：
+
+```zig
+// build.zig
+const libc_file = b.option([]const u8, "libc-file", "libc 配置文件路径 (Android)");
+if (libc_file) |lf| {
+    example_android.setLibCFile(.{ .cwd_relative = lf });
+}
+```
+
+libc 配置文件格式（key=value，每行一对）：
+```
+include_dir=/path/to/ndk/sysroot/usr/include
+sys_include_dir=/path/to/ndk/sysroot/usr/include
+crt_dir=/path/to/ndk/sysroot/usr/lib/aarch64-linux-android/35
+msvc_lib_dir=
+kernel32_lib_dir=
+gcc_dir=
+```
+
+- 空值 `=` 表示 null（字段可选时不强制）
+- `include_dir` / `sys_include_dir` / `crt_dir` 为必须字段（非 Darwin 目标）
+- 参考 `std/zig/LibCInstallation.zig` 的 `parse()` 了解完整字段
+
+### 13.5 `b.path()` 不能接受绝对路径 → `LazyPath.cwd_relative`
+
+```zig
+// ❌ 错误: panics on absolute path
+example.setLibCFile(b.path("/absolute/path/to/libc.conf"));
+
+// ✅ 正确: 用 LazyPath.cwd_relative
+example.setLibCFile(.{ .cwd_relative = "/absolute/path/to/libc.conf" });
+```
+
+### 13.6 `@ptrCast` 需要 `@alignCast` 当对齐增加时
+
+```zig
+// ❌ 错误: @ptrCast increases pointer alignment (alignment 1 → 2)
+const rc = std.c.bind(fd, @ptrCast(&sa_bytes), @intCast(sa_len));
+
+// ✅ 正确: 添加 @alignCast
+const rc = std.c.bind(fd, @ptrCast(@alignCast(&sa_bytes)), @intCast(sa_len));
+```
+
+这常出现在 Linux/Android 目标上，因为 `std.c.bind` 的 sockaddr 参数对齐要求高于 `[28]u8`。
+
+### 13.7 `[]u8` → `[*]const u8` for extern C functions
+
+```zig
+// ❌ 错误: expected type '[*]const u8', found '[]u8'
+_ = __android_log_write(priority, "tag", c_str);
+
+// ✅ 正确: 用 .ptr 获取指针
+_ = __android_log_write(priority, "tag", c_str.ptr);
+```
+
+切片 `[]u8` 的 `.ptr` 返回 `[*]u8`，可隐式 coerce 为 `[*]const u8`。
+
+---
+*最后更新: 2026-07-19*
 *来源: 从 zigtun/zigproxy/zproxy/zigbox 的 zig-codegen.md 提取合并*
-*本次新增: log.zig/cli.zig 重写 — Zig 0.16.0 I/O、日志、FFI、zli 集成经验*
+*本次新增: 第 13 章 — 交叉编译 (iOS/Android)、sysroot、libc 配置、CallingConvention、@alignCast、LazyPath*

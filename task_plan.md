@@ -57,12 +57,44 @@ Phase 6 (集成验证)
 - [x] `zig build test` 173/173 全绿
 - **Status:** complete
 
-### Phase 6: 集成验证
+### Phase 6: 集成验证 — 三平台示例程序
 - [x] 全量测试 `zig build test` 173/173 100% 通过
 - [x] `zig fmt --check` 通过
 - [x] API.md 替换 TBD 占位为实际 API 文档（13 模块完整 API 参考）
-- [ ] 兄弟项目（zigtun/zigproxy）切换为依赖 zigfoundation，验证编译通过
-- **Status:** in_progress
+- [x] 创建 `examples/cli/main.zig` — 桌面 CLI 集成测试，13 模块全量验证（macOS/Linux/Windows）
+- [x] 创建 `examples/ios/` — iOS 模拟器静态库 + Swift App (main.zig / AppDelegate.swift / Info.plist / build.sh)
+- [x] 创建 `examples/android/` — Android 模拟器 .so + JNI Activity (main.zig / MainActivity.java / AndroidManifest.xml / build.sh)
+- [x] 修改 `build.zig` — 添加 example-cli / example-ios / example-android 三个 build step
+- [x] 修改 `src/log.zig` — 修复 `.android` os.tag → `builtin.abi.isAndroid()`；`std.cstr.addNullByte` → 手动分配
+- [x] 修改 `src/cli.zig` — 重写 `createRoot()` 适配 Zig 0.16.0 Io API（std.io.getStdOut/getStdIn 已移除）
+- [x] 修改 `src/egress.zig` — INVALID_SOCKET 改为 pub
+- [x] CLI 示例在 macOS 上构建并运行通过（13 passed, 0 failed）
+- [ ] 兄弟项目（zigtun/zigproxy）切换为依赖 zigfoundation，验证编译通过（延后 — 兄弟项目尚未适配 Zig 0.16.0）
+- **Status:** complete
+
+### Phase 6a: 交叉编译验证 — iOS + Android 实际编译
+- [x] 查找本机 iOS SDK + Android NDK 路径
+- [x] 配置 `~/.bash_profile` 环境变量（IOS_SDK_HOME / ANDROID_HOME / ANDROID_SDK_ROOT / ANDROID_NDK_HOME）
+- [x] 修改 `build.zig`：`-Dsysroot` + `-Dlibc-file` 选项、NDK 架构特定 include
+- [x] 修改 `src/log.zig`：androidLog 分支 `std.cstr.addNullByte` 修复 + `[*]const u8` 适配
+- [x] 修改 `src/egress.zig`：`@alignCast` 修复 Linux/Android 对齐
+- [x] 修改 `examples/ios/main.zig` + `examples/android/main.zig`：移除 `callconv(.C)`（Zig 0.16.0 已移除）
+- [x] 更新 `examples/ios/build.sh` + `examples/android/build.sh`：使用 env vars
+- [x] iOS 编译成功：`libzigfoundation-example-ios.a` (5.5MB, aarch64-ios-simulator)
+- [x] Android 编译成功：`libzigfoundation-example-android.so` (6.4MB, aarch64-linux-android)
+- [x] 更新 `zig-codegen.md`（第 13 章交叉编译 + 8 条诊断）
+- [x] 更新 `CLAUDE.md`（构建命令 + 环境变量）
+- [x] 全量验证：`zig build test` 173/173 ✓, `zig fmt --check` ✓
+- **Status:** complete
+
+### Phase 6b: 交叉编译 CLI + 三平台 VM 测试 + Windows egress 修复
+- [x] 修复 `src/egress.zig` `createSocket()` — Windows `@intCast(-1)` → `usize` panic（socket 失败时 `-1` 无法转无符号类型）
+- [x] 交叉编译 CLI 到 Windows aarch64 (907KB) / Linux aarch64 (4.8MB) / macOS aarch64 (569KB)
+- [x] 跨平台代码适配：cli.zig (Windows kernel32 I/O)、log.zig (Windows stderr)、queue.zig (atomic spinlock)、egress.zig (winsock)
+- [x] Linux VM 测试：13/13 passed ✅
+- [x] macOS VM 测试：13/13 passed ✅
+- [x] Windows VM 测试：13/13 passed ✅（egress 崩溃已修复）
+- **Status:** complete
 
 ## Key Questions
 1. ring.zig 选 zigproxy 简化版 (199行) 还是 zproxy 完整版 (602行)？后者含跨平台同步原语

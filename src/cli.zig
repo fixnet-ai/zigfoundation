@@ -48,16 +48,126 @@ pub const CommandErrors = zli.CommandErrors;
 
 /// 创建根命令的便捷函数，自动设置 stdout/stderr writer。
 pub fn createRoot(allocator: std.mem.Allocator, opts: CommandOptions) !*Command {
-    const writer = std.io.getStdOut().writer();
-    const reader = std.io.getStdIn().reader();
+    var io_instance = std.Io.Threaded.init(allocator, .{});
+    _ = io_instance.io();
+
+    var out_buf: [4096]u8 = undefined;
+    var in_buf: [4096]u8 = undefined;
+
+    // 堆分配 Io 基础设施（生命周期与 Command 绑定）
+    const io_heap = try allocator.create(std.Io.Threaded);
+    io_heap.* = io_instance;
+
+    // 创建 stdout Writer（使用 raw POSIX write，避免 Io.File.Writer 类型不兼容问题）
+    const stdout_writer = makeStdoutWriter(&out_buf);
+    const writer_heap = try allocator.create(std.Io.Writer);
+    writer_heap.* = stdout_writer;
+
+    // 创建 stdin Reader
+    const stdin_reader = makeStdinReader(&in_buf);
+    const reader_heap = try allocator.create(std.Io.Reader);
+    reader_heap.* = stdin_reader;
+
     return try Command.init(.{
-        .io = std.io,
-        .writer = writer,
-        .reader = reader,
+        .io = io_heap.io(),
+        .writer = writer_heap,
+        .reader = reader_heap,
         .allocator = allocator,
     }, opts, struct {
         fn run(_: CommandContext) anyerror!void {}
     }.run);
+}
+
+fn stdoutDrain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+    _ = w;
+    _ = splat;
+    var total: usize = 0;
+    for (data) |chunk| {
+        writeStdout(chunk);
+        total += chunk.len;
+    }
+    return total;
+}
+
+fn writeStdout(bytes: []const u8) void {
+    if (builtin.os.tag == .windows) {
+        const stdout_h = winGetStdHandle(win.STD_OUTPUT_HANDLE);
+        _ = winWriteFile(stdout_h, bytes.ptr, @intCast(bytes.len));
+    } else {
+        _ = std.c.write(1, bytes.ptr, bytes.len);
+    }
+}
+
+const stdout_vtable: std.Io.Writer.VTable = .{ .drain = stdoutDrain };
+
+fn makeStdoutWriter(buf: []u8) std.Io.Writer {
+    return .{ .vtable = &stdout_vtable, .buffer = buf, .end = 0 };
+}
+
+fn stdinStream(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+    _ = r;
+    const buf = w.buffer;
+    const limit_usize: usize = @intFromEnum(limit);
+    const max_read = @min(buf.len, limit_usize);
+    if (max_read == 0) return 0;
+    if (builtin.os.tag == .windows) {
+        const stdin_h = winGetStdHandle(win.STD_INPUT_HANDLE);
+        var bytes_read: win.DWORD = 0;
+        if (winReadFile(stdin_h, buf.ptr, @intCast(max_read), &bytes_read) == 0)
+            return error.ReadFailed;
+        w.end = @intCast(bytes_read);
+        return @intCast(bytes_read);
+    } else {
+        const n = std.c.read(0, buf.ptr, max_read);
+        if (n < 0) return error.ReadFailed;
+        w.end = @intCast(n);
+        return @intCast(n);
+    }
+}
+
+// Windows I/O helpers — declared locally since Zig 0.16.0 std lib has minimal kernel32 coverage.
+const win = struct {
+    const HANDLE = *anyopaque;
+    const DWORD = u32;
+    const BOOL = i32;
+    const LPVOID = *anyopaque;
+
+    const STD_INPUT_HANDLE: DWORD = @as(DWORD, @bitCast(@as(i32, -10)));
+    const STD_OUTPUT_HANDLE: DWORD = @as(DWORD, @bitCast(@as(i32, -11)));
+
+    extern "kernel32" fn GetStdHandle(nStdHandle: DWORD) callconv(.winapi) HANDLE;
+    extern "kernel32" fn WriteFile(
+        hFile: HANDLE,
+        lpBuffer: [*]const u8,
+        nNumberOfBytesToWrite: DWORD,
+        lpNumberOfBytesWritten: ?*DWORD,
+        lpOverlapped: ?LPVOID,
+    ) callconv(.winapi) BOOL;
+    extern "kernel32" fn ReadFile(
+        hFile: HANDLE,
+        lpBuffer: [*]u8,
+        nNumberOfBytesToRead: DWORD,
+        lpNumberOfBytesRead: ?*DWORD,
+        lpOverlapped: ?LPVOID,
+    ) callconv(.winapi) BOOL;
+};
+
+fn winGetStdHandle(which: win.DWORD) win.HANDLE {
+    return win.GetStdHandle(which);
+}
+
+fn winWriteFile(h: win.HANDLE, buf: [*]const u8, len: u32) void {
+    _ = win.WriteFile(h, buf, len, null, null);
+}
+
+fn winReadFile(h: win.HANDLE, buf: [*]u8, len: u32, bytes_read: *win.DWORD) win.BOOL {
+    return win.ReadFile(h, buf, len, bytes_read, null);
+}
+
+const stdin_vtable: std.Io.Reader.VTable = .{ .stream = stdinStream };
+
+fn makeStdinReader(buf: []u8) std.Io.Reader {
+    return .{ .vtable = &stdin_vtable, .buffer = buf, .seek = 0, .end = 0 };
 }
 
 /// 以 noreturn 方式运行根命令并退出进程。
