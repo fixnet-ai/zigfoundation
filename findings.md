@@ -1,0 +1,96 @@
+# Findings & Decisions
+
+## Requirements
+- 从 zigproxy/zproxy/zigtun 提取公共组件到 zigfoundation
+- 依赖：Zig std + libxev（异步基础）+ libyaml C 库（yaml 模块），不再使用 zio
+- 五平台支持：Windows / macOS / Linux / iOS / Android
+- 100% 单元测试覆盖每个 pub fn
+- 工业级稳定性：内存分配可审计、错误路径清晰、无 unsafe 透出
+- 功能无关：不包含任何业务逻辑（代理、TUN、路由、DNS）
+
+## Research Findings
+
+### 项目现状 (2026-07-18)
+- 仓库：https://github.com/fixnet-ai/zigfoundation（已推送）
+- 构建系统：build.zig（静态库 + test/test-build 目标）、build.zig.zon
+- 入口模块：src/foundation.zig（barrel 模块，版本 0.1.0，子模块 import 已预留）
+- 文档：CLAUDE.md、API.md、zig-codegen.md（合并自 zigtun/zigproxy/zproxy）
+- Git 环境：.gitignore、.gitattributes、user.name=fixnet-ai、user.email=noreply
+- Skills：.claude/skills/zig、utm-vm（软链接 → ../../zigbox/.claude/skills/）
+- 提交历史：d22c375（骨架）→ 6310ac5（zig-codegen.md）→ 5d90ee4（git 基础环境）
+
+### 依赖分层
+
+```
+std only (8 modules):
+  buffer  ring  endian
+  platform  net
+  strings  cli  log
+
+std + libyaml C (1 module):
+  yaml
+
+std + libxev (4 modules):
+  store  event  queue  socket
+```
+
+### 提取源代码审计
+
+| 源文件 | 行数 | 提取目标 | Phase | 依赖清理难度 |
+|--------|------|---------|-------|-------------|
+| zigproxy/src/buffer.zig | 299 | buffer.zig | 1 | 低 — 仅依赖 std |
+| zproxy/src/core/ringbuf.zig | 602 | ring.zig | 1 | 中 — 跨平台原子操作 |
+| zigproxy/src/ringbuf.zig | 199 | ring.zig 简化备选 | 1 | 低 — 功能更少 |
+| — | — | endian.zig | 1 | 无 — 新建 |
+| zigproxy/src/platform.zig | 118 | platform.zig | 2 | 低 — 纯平台检测 |
+| zproxy/src/platform/system.zig | 269 | platform.zig 系统探测 | 2 | 中 — 信号处理 + 资源 |
+| zproxy/src/platform/time.zig | 176 | platform.zig 时间 | 2 | 低 |
+| zproxy/src/utils.zig | 897 | net.zig + strings.zig | 2/3 | 中 — 含 zproxy 特有 import |
+| zproxy/src/core/ip_cidr6.zig | 128 | net.zig CIDR | 2 | 低 — 纯逻辑 |
+| — | — | cli.zig | 3 | 无 — 新建 |
+| — | — | log.zig | 3 | 无 — 新建 |
+| — | — | yaml.zig | 3 | 低 — libyaml C FFI |
+| zigproxy | ? | store.zig | 4 | 待确认 |
+| zproxy/src/core/event.zig | 655 | event.zig | 4 | 中 — Posix + Windows 分支 |
+| zproxy/src/core/queue.zig | 348 | queue.zig | 4 | 中 — 依赖 event.zig |
+| — | — | socket.zig | 5 | 中 — 五平台 socket 差异大 |
+
+### 明确排除
+
+| 功能 | 原因 |
+|------|------|
+| DNS 协议/解析/缓存 | 应用层协议，不属于基础库 |
+| checksum（IP/TCP/UDP/ICMP） | 不提供 |
+| protocol 首字节检测 | 协议层，属于 zigproxy |
+| 业务配置结构/模板 | yaml.zig 只封装 libyaml，不含业务 schema |
+
+## Technical Decisions
+| Decision | Rationale |
+|----------|-----------|
+| 依赖分层（std → libyaml → libxev） | 明确外部依赖边界，Phase 按依赖递增编排 |
+| ring 而非 ringbuf | Zig 惯用短名，std.RingBuffer 前例 |
+| yaml 而非 config | 只封装 libyaml 解析/序列化，不承载业务配置，名字诚实 |
+| socket 而非 egress | 出站路由绑定本质是 socket 层操作，对开发者更直观 |
+| store 路径注入 | 注入模式，调用者传入路径并初始化，模块不持有全局状态 |
+| 不含 DNS | 应用层，属于 zproxy/zigproxy |
+| 不含 checksum | 不提供 |
+
+## Issues Encountered
+| Issue | Resolution |
+|-------|------------|
+| CLAUDE.md 跨项目引用路径错误（../zigtun/ 已不存在） | 修正为 ./ 本地路径引用 |
+| 原计划 11 模块 → 13 模块 | socket.zig（出站路由绑定）、yaml.zig（libyaml 封装）新增；平台/网络/signal/resource 明确划入对应模块 |
+
+## Resources
+- zproxy 参考：`../zproxy/src/utils.zig`、`core/event.zig`、`core/ringbuf.zig`、`core/queue.zig`、`platform/`
+- zigproxy 参考：`../zigproxy/src/buffer.zig`、`ringbuf.zig`、`platform.zig`
+- zigtun 参考：`../zigtun/src/checksum.zig`、`signal.zig`、平台适配代码
+- Zig 0.16.0 手册：https://ziglang.org/documentation/0.16.0/
+- 编码经验：`./zig-codegen.md`
+
+## Visual/Browser Findings
+-
+
+---
+*每 2 次查看/浏览器/搜索操作后更新此文件*
+*防止视觉信息丢失*

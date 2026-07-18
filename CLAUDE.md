@@ -12,7 +12,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ```
 fixnet/
-  zigfoundation/  ← 基础库 (本项目) — 零外部依赖，std only
+  zigfoundation/  ← 基础库 (本项目) — Zig std + libxev + libyaml
   libxev/         ← 异步 I/O 事件循环
   zigtun/         ← TUN 设备库 (依赖 zigfoundation + libxev)
   zigproxy/       ← 代理协议库 (依赖 zigfoundation + libxev)
@@ -22,21 +22,22 @@ fixnet/
 zigfoundation 处于依赖图最底层（仅次于 libxev），为所有兄弟项目提供：
 - 内存管理 (BufferPool、RingBuf)
 - 大小端转换 (Endian)
-- 字符串常用处理 (Strings)
-- 命令行程序框架 (CLI)
-- 日志框架 (Log)
-- 存储框架 (Store)
 - 平台抽象 (Platform)
-- 网络工具 (Net)
+- 网络工具 (Net、CIDR、Socket)
+- 字符串常用处理 (Strings)
+- 命令行框架 (CLI) + 信号处理
+- 日志框架 (Log)
+- YAML 解析 (libyaml 封装)
+- 存储框架 (Store)
 - 并发原语 (Event、Queue)
 
 ### 核心原则
 
-1. **零外部依赖** — 仅使用 Zig 标准库，不依赖 libxev 或任何第三方库
+1. **依赖分层** — std only 模块优先 → libyaml → libxev，不引入 zio 或其他框架
 2. **五平台支持** — Windows / macOS / Linux / iOS / Android
 3. **100% 单元测试覆盖** — 每个公开 API 都有对应测试
 4. **工业级稳定性** — 所有内存分配可审计、错误路径清晰、无 unsafe 透出
-5. **功能无关** — 不包含任何业务逻辑（代理、TUN、路由），纯粹的基础组件
+5. **功能无关** — 不包含任何业务逻辑（代理、TUN、路由、DNS），纯粹的基础组件
 
 ## 设计原则
 
@@ -70,59 +71,84 @@ zig build test-build         # 编译测试二进制（交叉编译用）
 
 ## 模块架构
 
-### Phase 8b — 内存管理基础
+### 依赖分层
+
+```
+std only (8):     buffer  ring  endian  platform  net  strings  cli  log
+std + libyaml (1): yaml
+std + libxev (4):  store  event  queue  socket
+```
+
+### Phase 1 — 内存管理（std only）
 
 | 模块 | 来源 | 描述 |
 |------|------|------|
 | `buffer.zig` | 从 zigproxy 提取 | BufferPool: LIFO 复用、shrink-to-initial 策略 |
-| `ringbuf.zig` | 从 zproxy 提取 | SPSC RingBuf: 跨线程无锁环缓冲区 |
+| `ring.zig` | 从 zproxy 提取 | SPSC RingBuf: 跨线程无锁环缓冲区 |
 | `endian.zig` | 新建薄封装 | 大小端读写统一 API (消除各处散落的 std.mem.readInt) |
 
-### Phase 8c — 平台与网络
+### Phase 2 — 平台与网络（std only）
 
 | 模块 | 来源 | 描述 |
 |------|------|------|
-| `platform.zig` | 合并 zigproxy + zigtun | 时间获取、平台检测、系统 DNS 探测 |
-| `net.zig` | 从 zproxy/utils.zig 提取 | IP 格式化/解析、域名判断、checksum、parseHostPort |
+| `platform.zig` | 合并 zigproxy + zigtun + zproxy | 时间获取、平台检测、系统资源探测 (CPU/fd/线程池)、系统 DNS 探测 |
+| `net.zig` | 从 zproxy/utils.zig 提取 | IP 格式化/解析、完整 IPv4/v6 CIDR 接口、域名判断、parseHostPort。不含 checksum |
 
-### Phase 8d — 应用框架
+### Phase 3 — 应用框架（std + libyaml）
 
 | 模块 | 来源 | 描述 |
 |------|------|------|
 | `strings.zig` | 从 zproxy/utils.zig 提取 | 字符串切割、trim、大小写转换等常用操作 |
-| `cli.zig` | 新建 | 命令行参数解析、信号处理抽象、守护进程化 |
+| `cli.zig` | 新建 | 命令行参数解析、跨平台信号处理 + 退出回调 (SIGINT/SIGTERM/SIGHUP)、守护进程化 |
 | `log.zig` | 新建 | 分级日志 (trace/debug/info/warn/err)、多输出后端 |
+| `yaml.zig` | 新建 | libyaml C 库封装 (build.zig 集成编译 + API)，不提供业务配置结构 |
 
-### Phase 8e — 存储与并发
+### Phase 4 — 存储与并发（std + libxev）
 
 | 模块 | 来源 | 描述 |
 |------|------|------|
-| `store.zig` | 从 zigproxy 提取 | 持久化缓存 (文件读写、原子替换、过期清理) |
-| `event.zig` | 从 zproxy/core/event.zig 提取 | ResetEvent: 跨平台事件通知 (Posix + Windows) |
-| `queue.zig` | 从 zproxy/core/queue.zig 提取 | CommandQueue + MonitorQueue (MPSC 模式) |
+| `store.zig` | 从 zigproxy 提取 | 持久化缓存 (路径由调用者注入，文件读写、原子替换、过期清理)，不绑定 DNS |
+| `event.zig` | 从 zproxy/core/event.zig 提取 | ResetEvent: 跨平台事件通知 (Posix + Windows)，基于 libxev |
+| `queue.zig` | 从 zproxy/core/queue.zig 提取 | CommandQueue + MonitorQueue (MPSC 模式)，基于 libxev |
+
+### Phase 5 — 网络出站（std + libxev）
+
+| 模块 | 来源 | 描述 |
+|------|------|------|
+| `socket.zig` | 新建 | 网络出站 + 绕过路由绑定: SO_BINDTODEVICE / IP_BOUND_IF / IP_UNICAST_IF、源地址绑定、出站路由策略 |
 
 ## 参考代码
 
-- `../zproxy/src/utils.zig` — 网络工具 + 字符串处理 (897 行，生产验证)
 - `../zproxy/src/core/event.zig` — ResetEvent 跨平台事件 (655 行)
 - `../zproxy/src/core/ringbuf.zig` — SPSC 环缓冲区 (602 行)
 - `../zproxy/src/core/queue.zig` — MPSC 队列 (348 行)
+- `../zproxy/src/core/ip_cidr6.zig` — IPv6 CIDR (128 行)
+- `../zproxy/src/utils.zig` — 网络工具 + 字符串处理 (897 行，生产验证)
+- `../zproxy/src/platform/system.zig` — 系统资源探测 + 信号处理 (269 行)
+- `../zproxy/src/platform/time.zig` — 跨平台单调时钟 (176 行)
 - `../zigproxy/src/buffer.zig` — BufferPool 实现 (299 行)
 - `../zigproxy/src/ringbuf.zig` — 简化 RingBuf (199 行)
 - `../zigproxy/src/platform.zig` — 平台工具 (118 行)
-- `../zigtun/zig-codegen.md` — Zig 0.16.0 编码经验
+- `./zig-codegen.md` — Zig 0.16.0 编码经验
 
 ## 重要规则
 
 ### Zig 0.16.0
 
 - 使用 `zig build test` 运行测试
-- 遇到编译错误时参考 `../zigtun/zig-codegen.md` 的编码经验
+- 遇到编译错误时参考 `./zig-codegen.md` 的编码经验
 - 从 [Zig 0.16.0 语言手册](https://ziglang.org/documentation/0.16.0/) 查找正确用法
 - `@Type` 已移除 → 使用 `@Int`/`@Enum`/`@Struct`/`@Union`/`@Pointer`/`@Fn`
 - `usingnamespace` 已移除 → 显式重新导出
 - 容器初始化：`.empty`（空集合）、`.init`（有状态类型），禁止 `.{}`
 - build.zig: `root_source_file` → `root_module = b.createModule(...)`
+
+### 依赖规则
+
+- std only 模块：buffer、ring、endian、platform、net、strings、cli、log — 不依赖 libxev
+- libyaml 模块：yaml — 仅依赖 std + libyaml C 库
+- libxev 模块：store、event、queue、socket — 可依赖 std + libxev
+- 禁止引入 zio 或任何其他第三方框架
 
 ### 代码编写
 
@@ -146,4 +172,4 @@ zig build test-build         # 编译测试二进制（交叉编译用）
 
 **先思考再编码。不要假设。简单优先。精准变更。目标驱动执行。**
 
-详见 `../zigtun/CLAUDE.md` 行为准则章节。
+详见 `./CLAUDE.md` 行为准则章节。
