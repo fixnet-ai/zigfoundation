@@ -1,5 +1,15 @@
 # Progress Log
 
+### 代码审查会话 — 逐文件 bug 审查 (2026-07-19)
+- **Status:** complete（审查完成，修复待用户决策）
+- Actions taken:
+  - 6 个并行审查 agent 分组逐行审查全部源码（13 模块 + 5 示例 + build.zig，5874 行含测试）
+  - 主会话对抗验证每项发现：重读源码 + std 0.16 源码 grep + macOS SDK 头文件 + @sizeOf 探针 + queue 溢出运行复现
+  - 结果：**62 项确认发现（HIGH 16 / MEDIUM 26 / LOW ~20），0 项误报**，详见 findings.md「全库代码审查」章节
+  - 最严重：egress Darwin 常量致 Linux/Android 全失效（被示例 catch-as-pass 掩盖）、cli.zig I/O 层悬垂/死循环 + 4 个不可编译死 API、空 YAML → panic、queue 溢出数据损坏、Cidr4 /0 panic、ip6ToInt 字节序颠倒
+  - 关键教训：懒分析盲区（无 refAllDecls）、catch-as-pass、round-trip 对称掩盖、单测仅 macOS host
+- Errors encountered: 无（只读审查）
+
 ### Phase 4: 存储、配置与并发（std + libyaml + libxev）
 - **Status:** complete
 - Actions taken:
