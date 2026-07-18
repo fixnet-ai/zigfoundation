@@ -1159,7 +1159,98 @@ _ = __android_log_write(priority, "tag", c_str.ptr);
 
 切片 `[]u8` 的 `.ptr` 返回 `[*]u8`，可隐式 coerce 为 `[*]const u8`。
 
+### 13.8 Windows socket: `@intCast` 溢出 — 必须先检查负数再转无符号
+
+`std.c.socket()` 返回 `c_int`（i32）。Windows 上 `std.posix.socket_t` 是 `*anyopaque`（指针），
+需要 `@ptrFromInt(@as(usize, @intCast(raw)))` 转换。但失败时 `raw = -1`，不能直接 cast 到 `usize`：
+
+```zig
+// ❌ 致命错误: socket 失败时 raw = -1，@intCast(-1) → usize panic
+const raw = std.c.socket(domain, sock_type, protocol);
+const fd: std.posix.socket_t = @ptrFromInt(@as(usize, @intCast(raw)));
+
+// ✅ 正确: 先检查负数再转换
+const raw = std.c.socket(domain, sock_type, protocol);
+if (builtin.os.tag == .windows) {
+    if (raw < 0) return error.SocketCreateFailed;
+    return @ptrFromInt(@as(usize, @intCast(raw)));
+} else {
+    if (raw == INVALID_SOCKET) return error.SocketCreateFailed;
+    return raw;
+}
+```
+
+### 13.9 Windows `std.posix.setsockopt` → compileError
+
+Zig 0.16.0 在 Windows 上 `std.posix.setsockopt` 的函数体直接是 `@compileError("use std.Io instead")`。
+必须使用跨平台 wrapper 调用 winsock：
+
+```zig
+const winSock = struct {
+    const SOCKET = usize;
+    extern "ws2_32" fn setsockopt(
+        s: SOCKET, level: c_int, optname: c_int, optval: [*]const u8, optlen: c_int,
+    ) callconv(.winapi) c_int;
+    extern "ws2_32" fn closesocket(s: SOCKET) callconv(.winapi) c_int;
+};
+
+fn sockSetOpt(fd: std.posix.socket_t, level: i32, optname: u32, opt: []const u8) !void {
+    if (builtin.os.tag == .windows) {
+        const sock: winSock.SOCKET = @intFromPtr(fd);
+        const rc = winSock.setsockopt(sock, level, @intCast(optname), opt.ptr, @intCast(opt.len));
+        if (rc != 0) return error.SetSockOptFailed;
+    } else {
+        try std.posix.setsockopt(fd, level, optname, opt);
+    }
+}
+```
+
+### 13.10 Windows Mutex: atomic spinlock 替代 pthread
+
+Zig 0.16.0 `std.Thread.Mutex` 不存在。Windows 没有 `pthread_mutex_t`（`std.c.pthread_mutex_t = void`）。
+
+```zig
+const Mutex = if (builtin.os.tag == .windows)
+    struct {
+        locked: bool = false,
+        fn lock(self: *@This()) void {
+            while (@atomicRmw(bool, &self.locked, .Xchg, true, .acquire)) {
+                std.atomic.spinLoopHint();
+            }
+        }
+        fn unlock(self: *@This()) void {
+            @atomicStore(bool, &self.locked, false, .release);
+        }
+    }
+else
+    std.c.pthread_mutex_t;
+```
+
+### 13.11 Windows I/O: kernel32 本地声明
+
+Zig 0.16.0 `std.os.windows.kernel32` 几乎无声明，必须本地 `extern "kernel32"`：
+
+```zig
+const win = struct {
+    const HANDLE = *anyopaque;
+    const DWORD = u32;
+    const BOOL = i32;
+    const LPVOID = *anyopaque;
+    extern "kernel32" fn GetStdHandle(nStdHandle: DWORD) callconv(.winapi) HANDLE;
+    extern "kernel32" fn WriteFile(hFile: HANDLE, lpBuffer: [*]const u8,
+        nNumberOfBytesToWrite: DWORD, lpNumberOfBytesWritten: ?*DWORD,
+        lpOverlapped: ?LPVOID) callconv(.winapi) BOOL;
+    extern "kernel32" fn ReadFile(hFile: HANDLE, lpBuffer: [*]u8,
+        nNumberOfBytesToRead: DWORD, lpNumberOfBytesRead: ?*DWORD,
+        lpOverlapped: ?LPVOID) callconv(.winapi) BOOL;
+};
+```
+
+**关键规则：**
+- `callconv(.winapi)` 不是 `callconv(.C)`（后者已移除）
+- `?*DWORD` 而非 `?LPDWORD`：`LPDWORD = ?*DWORD`，用在函数参数中产生 `??*DWORD`，Win64 calling convention 不接受双重 optional
+
 ---
 *最后更新: 2026-07-19*
 *来源: 从 zigtun/zigproxy/zproxy/zigbox 的 zig-codegen.md 提取合并*
-*本次新增: 第 13 章 — 交叉编译 (iOS/Android)、sysroot、libc 配置、CallingConvention、@alignCast、LazyPath*
+*本次新增: 第 13 章 — 交叉编译 (iOS/Android/Windows)、sysroot、libc 配置、CallingConvention、@alignCast、LazyPath、Windows socket/mutex/I/O 模式*

@@ -75,17 +75,18 @@ zig fetch --save=zli <url>   # 更新 zli 依赖版本（仅在升级 zli 时需
 ```bash
 # 桌面 CLI 集成测试 (macOS/Linux/Windows)
 zig build example-cli
+zig build example-cli -Dtarget=aarch64-linux-musl    # Linux ARM64
+zig build example-cli -Dtarget=aarch64-windows-gnu   # Windows ARM64
 ./zig-out/bin/zigfoundation-example-cli
 
-# iOS 模拟器静态库 (需 Xcode + IOS_SDK_HOME 环境变量)
-zig build example-ios -Dtarget=aarch64-ios-simulator -Dsysroot="$IOS_SDK_HOME"
+# iOS 静态库 (需 Xcode)
+zig build example-ios -Dtarget=aarch64-ios-simulator -Dsysroot="$IOS_SDK_HOME_SIM"
+zig build example-ios -Dtarget=aarch64-ios -Dsysroot="$IOS_SDK_HOME_DEVICE"
 # → zig-out/lib/libzigfoundation-example-ios.a
-# 或直接运行: examples/ios/build.sh
 
-# Android 模拟器共享库 (需 Android NDK + ANDROID_NDK_HOME 环境变量)
-# 先运行: examples/android/build.sh  (自动生成 libc.conf + 构建)
-# 手动: zig build example-android -Dtarget=aarch64-linux-android \
-#          -Dsysroot="$ANDROID_NDK_HOME/.../sysroot" -Dlibc-file=<libc.conf>
+# Android 动态库 (需 Android NDK)
+zig build example-android -Dtarget=aarch64-linux-android \
+    -Dsysroot="$ANDROID_NDK_HOME/.../sysroot" -Dlibc-file=<libc.conf>
 # → zig-out/lib/libzigfoundation-example-android.so
 ```
 
@@ -94,7 +95,8 @@ zig build example-ios -Dtarget=aarch64-ios-simulator -Dsysroot="$IOS_SDK_HOME"
 在 `~/.bash_profile` 中设置：
 
 ```bash
-export IOS_SDK_HOME=$(xcrun --sdk iphonesimulator --show-sdk-path 2>/dev/null)
+export IOS_SDK_HOME_SIM=$(xcrun --sdk iphonesimulator --show-sdk-path 2>/dev/null)
+export IOS_SDK_HOME_DEVICE=$(xcrun --sdk iphoneos --show-sdk-path 2>/dev/null)
 export ANDROID_HOME="$HOME/Library/Android/sdk"
 export ANDROID_SDK_ROOT="$ANDROID_HOME"
 export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/30.0.15729638"
