@@ -1,0 +1,16 @@
+.{
+    .name = .zigfoundation,
+    .version = "0.1.0",
+    .fingerprint = 0xffd2f4ee174e2a18,
+    .minimum_zig_version = "0.16.0",
+
+    .dependencies = .{
+        // 零外部依赖 — 仅使用 Zig 标准库
+    },
+
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
