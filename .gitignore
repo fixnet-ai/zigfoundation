@@ -11,6 +11,7 @@ Thumbs.db
 zig-out/
 .zig-cache/
 zig-pkg/
+examples/ios/.build/
 
 # Claude Code
 .claude/

@@ -131,6 +131,17 @@ Phase 6 (集成验证)
 - [x] 创建 Memory：`android-cross-compilation-with-zig.md` + `test-log-level-restore.md`
 - **Status:** complete
 
+### Phase 6f: iOS 模拟器 simctl spawn 测试 — 自动运行日志问题闭环
+- [x] 根因定位：Zig 0.16.0 交叉链接 iOS exe/dylib 时不在 sysroot `usr/lib` 下查找 `libSystem.tbd`（静态库不链接故无此问题 — 上一会话 spawn 路径未跑通的原因）
+- [x] 修复 `build.zig`：ios_test_mod 添加 `addLibraryPath(.{ .cwd_relative = "/usr/lib" })`（MachO linker 自动加 sysroot 前缀）
+- [x] Debug 模式 `__dyld_get_image_header_containing_address` 符号缺失 → iOS 目标固定 ReleaseSmall
+- [x] 构建产物：`zigfoundation-ios-test` (217KB exe) + `libzigfoundation-ios-dylib.dylib` (155KB)
+- [x] iOS 模拟器测试：**13/13 模块全部 PASS**（iPhone 17 / iOS 26.5，`simctl spawn` 直连终端 + 退出码 0）
+- [x] 日志问题闭环：spawn 路径 stdout/stderr 直连终端，无需截图 / log stream / .app bundle
+- [x] 回归：`zig build test` 173/173 ✅ + `zig fmt --check` ✅
+- [x] `.gitignore` 追加 `examples/ios/.build/`（iOS .app 构建产物）
+- **Status:** complete
+
 ## Key Questions
 1. ring.zig 选 zigproxy 简化版 (199行) 还是 zproxy 完整版 (602行)？后者含跨平台同步原语
 2. endian 封装粒度：只封 readInt 还是连 writeInt 一起？

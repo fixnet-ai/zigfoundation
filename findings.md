@@ -64,6 +64,14 @@ std + libxev (4 modules):
 | protocol 首字节检测 | 协议层，属于 zigproxy |
 | 业务配置结构/模板 | yaml.zig 只封装 libyaml，不含业务 schema |
 
+### iOS 模拟器自动运行日志问题 — 已解决 (2026-07-19)
+
+- **问题**：`.app` 路径（build-and-run.sh）用 `simctl launch` 启动后 stdout/stderr 不回流脚本终端，只能截图 + 手动 `log stream` —— 无法自动断言测试结果
+- **方案**：`examples/ios/test_runner.zig` + build.zig `ios-test-runner` step —— 纯 CLI 可执行文件，`xcrun simctl spawn booted` 直接运行，stdout/stderr 直连终端（与 Android adb shell 方案同构）
+- **上一会话未跑通的根因**：Zig 0.16.0 交叉链接 iOS exe/dylib 时不在 sysroot `usr/lib` 下查找 `libSystem.tbd`（静态库不链接故 Phase 6a 未暴露）→ 已修复：build.zig `addLibraryPath(.{ .cwd_relative = "/usr/lib" })` + ReleaseSmall
+- **验证**：iPhone 17 / iOS 26.5 模拟器 `simctl spawn` → 13/13 PASS，退出码 0，[PASS] 逐行实时输出
+- **运行命令**：`zig build ios-test-runner -Dtarget=aarch64-ios-simulator -Doptimize=ReleaseSmall -Dsysroot="$IOS_SDK_HOME_SIM"` → `xcrun simctl spawn booted zig-out/bin/zigfoundation-ios-test`
+
 ## Technical Decisions
 | Decision | Rationale |
 |----------|-----------|

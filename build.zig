@@ -111,6 +111,9 @@ pub fn build(b: *std.Build) void {
     if (sysroot) |s| {
         const sysroot_include = b.pathJoin(&.{ s, "usr", "include" });
         ios_test_mod.addSystemIncludePath(.{ .cwd_relative = sysroot_include });
+        // Zig 交叉链接 iOS exe/dylib 不会自动在 sysroot 下查找 libSystem.tbd。
+        // 显式 -L/usr/lib：MachO linker 会自动加 sysroot 前缀 → <sysroot>/usr/lib
+        ios_test_mod.addLibraryPath(.{ .cwd_relative = "/usr/lib" });
     }
 
     const ios_test_exe = b.addExecutable(.{

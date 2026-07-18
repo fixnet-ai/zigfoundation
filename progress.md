@@ -329,6 +329,27 @@
   - `addLibraryPath` 路径被 sysroot 加倍 → 最终避开（动态链接不需要额外 -L）
   - `testLog()` 永久改变全局日志级别 → 测试末尾恢复 `.info`
 
+### Phase 6f: iOS 模拟器 simctl spawn 测试 — 自动运行日志问题闭环
+- **Status:** complete
+- Actions taken:
+  - 核查上一会话状态：spawn 方案（test_runner.zig + ios-test-runner step）已提交但无运行通过的证据；`.app` 路径 simctl launch 日志不回流终端（只能截图）
+  - 最小用例重现构建失败：`error: unable to find libSystem system library` — Zig 0.16.0 交叉链接 iOS exe/dylib 时不在 sysroot `usr/lib` 下查找 `.tbd`（example-ios 静态库不链接故 Phase 6a 未暴露）
+  - 方案对比：`--libc` conf（crt_dir）与 `-L/usr/lib`（sysroot 前缀）均可行，选后者（一行改动、无额外文件）
+  - 修复 `build.zig`：ios_test_mod 在 sysroot 分支追加 `addLibraryPath(.{ .cwd_relative = "/usr/lib" })`
+  - 构建成功：`zigfoundation-ios-test` (217KB, Mach-O arm64) + `libzigfoundation-ios-dylib.dylib` (155KB)
+  - iOS 模拟器运行：`xcrun simctl spawn booted zig-out/bin/zigfoundation-ios-test` → **13/13 PASS，退出码 0**（iPhone 17 / iOS 26.5）
+  - 日志问题闭环：spawn 直连 stdout/stderr，[PASS]/[FAIL] 逐行实时可见，退出码可自动断言
+  - 回归：`zig build test` 173/173 ✅ + `zig fmt --check` ✅
+  - `.gitignore` 追加 `examples/ios/.build/`
+- Files created/modified:
+  - build.zig (modified — ios_test_mod addLibraryPath "/usr/lib")
+  - .gitignore (modified — examples/ios/.build/)
+  - zig-codegen.md (updated — 13.12 iOS libSystem 交叉链接)
+  - task_plan.md / findings.md / progress.md (updated)
+- Errors encountered:
+  - `unable to find libSystem system library` → `-L` 传绝对 SDK 路径被 sysroot 二次前缀 → 改用 `/usr/lib` 相对形式让 linker 前缀
+  - `undefined symbol: __dyld_get_image_header_containing_address` (Debug) → std.debug.SelfInfo 引用 iOS 不存在的符号 → ReleaseSmall
+
 ### Infrastructure: GitHub MCP 插件
 - **Status:** complete
 - Actions taken:
@@ -343,15 +364,17 @@
 | 2026-07-19 | Windows @intCast(-1)→usize panic | 1 | 在 Windows 分支 @intCast 前添加 `if (raw < 0) return error.SocketCreateFailed` |
 | 2026-07-19 | NDK 30 libc.a 含 Rust std (Unwind 符号缺失) | 2 | 改用 `.linkage = .dynamic` 动态链接 |
 | 2026-07-19 | testLog() 抑制后续所有 PASS 输出 | 1 | testLog 末尾恢复 `.info` 级别；ios + android test_runner 均修复 |
+| 2026-07-19 | iOS exe 链接 `unable to find libSystem` | 2 | build.zig `addLibraryPath(.{ .cwd_relative = "/usr/lib" })`（linker 加 sysroot 前缀）；绝对 SDK 路径会被二次前缀 |
+| 2026-07-19 | iOS Debug 链接 `__dyld_get_image_header_containing_address` 缺失 | 1 | iOS 目标固定 ReleaseSmall |
 
 ## 5-Question Reboot Check
 | Question | Answer |
 |----------|--------|
-| 我在哪里？ | Phase 6e 完成 — Android ARM64 模拟器真机测试 13/13 全绿；173/173 测试全绿 |
-| 我要去哪里？ | 后续：兄弟项目适配 Zig 0.16.0 后的集成验证；持续维护 |
+| 我在哪里？ | Phase 6f 完成 — iOS 模拟器 simctl spawn 测试 13/13 全绿，五平台真机/模拟器运行验证全部闭环 |
+| 我要去哪里？ | 后续：兄弟项目适配 Zig 0.16.0 后的集成验证（唯一遗留）；持续维护 |
 | 目标是什么？ | 实现 13 个工业级基础模块，100% 测试覆盖，五平台 — 已达成 |
-| 我学到了什么？ | 1) Zig 0.16.0 libc conf 要求全部 6 字段；2) NDK 30 libc.a 含 Rust std → 必须动态链接；3) Android 原生程序 stderr 自动到 logcat；4) 日志级别是全局状态，testLog 必须恢复；5) addModule=公开模块、createModule=私有模块；6) b.sysroot 不自动传播到 dependency C 编译 include path |
-| 我做了什么？ | Phase 6e: Android ARM64 模拟器真机测试（动态执行文件 + logcat 输出）+ 日志级别恢复修复 + Memory + 文档更新 |
+| 我学到了什么？ | 1) Zig 交叉链接 iOS exe/dylib 不自动在 sysroot 找 libSystem.tbd → `-L/usr/lib` 相对形式；2) iOS Debug 构建缺 `__dyld_get_image_header_containing_address` → ReleaseSmall；3) simctl spawn 直连终端是 iOS 自动化测试正解（同 Android adb shell 模式）；4) 静态库不链接所以链接类问题在 .a 阶段不暴露 |
+| 我做了什么？ | Phase 6f: 修复 iOS libSystem 链接 → simctl spawn 13/13 PASS → 日志问题闭环 + 文档/经验沉淀 |
 
 ---
 *每个阶段完成或遇到错误后更新此文件*

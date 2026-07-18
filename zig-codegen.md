@@ -1041,6 +1041,8 @@ while (i > 0) {
 | `@ptrCast increases pointer alignment` | 指针转换时对齐增加 | 添加 `@alignCast` |
 | `expected type '[*]const u8', found '[]u8'` | extern C 函数需要指针 | 用 `.ptr` 取切片指针 |
 | `'asm/types.h' file not found` (Android) | 缺少架构特定 include | 添加 NDK arch 目录 to addSystemIncludePath |
+| `unable to find libSystem system library` (iOS) | Zig 不在 sysroot usr/lib 查找 .tbd | `addLibraryPath(.{ .cwd_relative = "/usr/lib" })` 由 linker 加 sysroot 前缀 |
+| `undefined symbol: __dyld_get_image_header_containing_address` | iOS Debug 构建 std.debug 引用不存在符号 | iOS 目标用 `-Doptimize=ReleaseSmall` |
 
 ---
 
@@ -1249,6 +1251,39 @@ const win = struct {
 **关键规则：**
 - `callconv(.winapi)` 不是 `callconv(.C)`（后者已移除）
 - `?*DWORD` 而非 `?LPDWORD`：`LPDWORD = ?*DWORD`，用在函数参数中产生 `??*DWORD`，Win64 calling convention 不接受双重 optional
+
+### 13.12 iOS 交叉链接 exe/dylib: `unable to find libSystem system library`
+
+Zig 0.16.0 交叉链接 iOS/模拟器**可执行文件或 dylib** 时，即使传了 `--sysroot`，
+也不会自动在 `<sysroot>/usr/lib` 下查找 `libSystem.tbd`。静态库 `.a` 不经过链接，
+所以此问题在构建静态库时不会暴露：
+
+```zig
+// build.zig — 修复：显式 -L/usr/lib，MachO linker 自动加 sysroot 前缀
+if (sysroot) |s| {
+    mod.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ s, "usr", "include" }) });
+    mod.addLibraryPath(.{ .cwd_relative = "/usr/lib" }); // → <sysroot>/usr/lib
+}
+```
+
+**关键点：**
+- `-L` 传绝对 SDK 路径会被 sysroot **二次前缀**（`<SDK><SDK>/usr/lib` → FileNotFound 警告），
+  必须用 `/usr/lib` 相对形式，由 linker 拼接 sysroot
+- 替代方案：`--libc` conf（`crt_dir=<SDK>/usr/lib`）同样有效，但需要额外文件
+- Debug 模式链接 iOS 会报 `undefined symbol: __dyld_get_image_header_containing_address`
+  （std.debug.SelfInfo 引用，iOS 无此符号）→ iOS 目标固定用 `-Doptimize=ReleaseSmall`
+
+### 13.13 iOS 模拟器自动化测试: simctl spawn 直连终端
+
+`.app` bundle + `simctl launch` 的 stdout/stderr 不回流终端，无法自动断言。
+正解与 Android adb shell 同构 —— 构建纯 CLI 可执行文件直接 spawn：
+
+```bash
+zig build ios-test-runner -Dtarget=aarch64-ios-simulator \
+    -Doptimize=ReleaseSmall -Dsysroot="$(xcrun --sdk iphonesimulator --show-sdk-path)"
+xcrun simctl spawn booted zig-out/bin/zigfoundation-ios-test
+# stdout/stderr 直连当前终端，退出码可断言
+```
 
 ---
 *最后更新: 2026-07-19*
