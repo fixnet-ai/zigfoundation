@@ -5,8 +5,14 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     // =======================================================================
+    // 外部依赖
+    // =======================================================================
+
+    const zli_dep = b.dependency("zli", .{});
+    const zli_module = zli_dep.module("zli");
+
+    // =======================================================================
     // 库模块 — zigfoundation 基础库
-    // zero external dependencies, std only
     // =======================================================================
 
     const lib_module = b.createModule(.{
@@ -14,6 +20,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    lib_module.addImport("zli", zli_module);
 
     // ---- 目标: 静态库 ----
     const lib = b.addLibrary(.{

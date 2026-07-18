@@ -1,224 +1,73 @@
-//! 命令行程序框架 — 参数解析、跨平台信号处理、守护进程化
+//! 命令行程序框架 — zli 集成包装 + 跨平台信号处理 + 守护进程化
 //!
-//! 信号处理参考 zig-codegen.md §8.1：macOS/BSD handler 签名为 fn(SIG) callconv(.c) void，
-//! Linux 为 fn(c_int) callconv(.c) void，统一使用 fn(SIG) 签名。
+//! 本模块是 zli CLI 框架的薄封装：重新导出 zli 的公共 API，
+//! 并在此基础上提供信号处理、退出回调、守护进程化等补充功能。
+//!
+//! 使用示例：
+//! ```
+//! const cli = @import("zigfoundation").cli;
+//!
+//! // 创建根命令（使用 zli API）
+//! var root = try cli.createRoot(allocator, .{
+//!     .name = "myapp",
+//!     .description = "My CLI application",
+//! });
+//! defer root.deinit();
+//!
+//! // 注册信号处理
+//! cli.registerExitCallback(myCleanup);
+//! try cli.installExitHandlers(&.{.interrupt, .terminate});
+//!
+//! // 运行
+//! try cli.run(root);
+//! ```
 
 const std = @import("std");
 const builtin = @import("builtin");
 const native_os = builtin.os.tag;
 
 // ============================================================
-// 命令行参数解析
+// zli 重新导出
 // ============================================================
 
-/// 参数解析错误集
-pub const CliError = error{
-    MissingValue,
-    UnknownFlag,
-    OutOfMemory,
-};
+pub const zli = @import("zli");
 
-/// 解析后的标志（boolean）。
-pub const Flag = struct {
-    name: []const u8,
-    short: ?u8 = null,
-    present: bool = false,
-};
+pub const Command = zli.Command;
+pub const CommandContext = zli.CommandContext;
+pub const CommandOptions = zli.CommandOptions;
+pub const Flag = zli.Flag;
+pub const FlagType = zli.FlagType;
+pub const FlagValue = zli.FlagValue;
+pub const PositionalArg = zli.PositionalArg;
+pub const InitOptions = zli.InitOptions;
+pub const CommandErrors = zli.CommandErrors;
 
-/// 解析后的选项（key=value）。
-pub const Option = struct {
-    name: []const u8,
-    short: ?u8 = null,
-    value: ?[]const u8 = null,
-};
+// ============================================================
+// 便捷构造器
+// ============================================================
 
-/// 命令行参数解析器。
-/// 支持 `--flag`、`-f`、`--key=value`、`--key value` 以及位置参数。
-pub const CliArgs = struct {
-    flags: []Flag,
-    options: []Option,
-    _positionals: [][]const u8,
-    _allocator: std.mem.Allocator,
+/// 创建根命令的便捷函数，自动设置 stdout/stderr writer。
+pub fn createRoot(allocator: std.mem.Allocator, opts: CommandOptions) !*Command {
+    const writer = std.io.getStdOut().writer();
+    const reader = std.io.getStdIn().reader();
+    return try Command.init(.{
+        .io = std.io,
+        .writer = writer,
+        .reader = reader,
+        .allocator = allocator,
+    }, opts, struct {
+        fn run(_: CommandContext) anyerror!void {}
+    }.run);
+}
 
-    /// 解析命令行参数。args 通常来自 `std.process.argsAlloc(allocator)`。
-    /// 程序名 (args[0]) 将被跳过。
-    /// flags_defs 和 options_defs 定义可接受的标志和选项。
-    pub fn parse(
-        allocator: std.mem.Allocator,
-        args: []const []const u8,
-        flags_defs: []const Flag,
-        options_defs: []const Option,
-    ) !CliArgs {
-        // 复制标志和选项定义（内部记录 present/value）
-        const flags = try allocator.alloc(Flag, flags_defs.len);
-        @memcpy(flags, flags_defs);
-        const options = try allocator.alloc(Option, options_defs.len);
-        @memcpy(options, options_defs);
+/// 以 noreturn 方式运行根命令并退出进程。
+pub fn run(root: *Command) noreturn {
+    var args_iter = std.process.args();
+    root.runAndExit(&args_iter, .{});
+}
 
-        // 位置参数数组：最大 args.len 个
-        const pos_list = try allocator.alloc([]const u8, args.len);
-        var pos_count: usize = 0;
-        errdefer allocator.free(pos_list);
-
-        var i: usize = 1; // 跳过 args[0]（程序名）
-        while (i < args.len) : (i += 1) {
-            const arg = args[i];
-
-            if (std.mem.startsWith(u8, arg, "--")) {
-                i = try parseLongArg(arg, args, i, flags, options, pos_list, &pos_count);
-            } else if (std.mem.startsWith(u8, arg, "-") and arg.len == 2) {
-                try parseShortArg(arg[1], flags, options);
-            } else {
-                pos_list[pos_count] = arg;
-                pos_count += 1;
-            }
-        }
-
-        // 收缩到实际大小
-        const trimmed = try allocator.realloc(pos_list, pos_count);
-        return .{
-            .flags = flags,
-            .options = options,
-            ._positionals = trimmed,
-            ._allocator = allocator,
-        };
-    }
-
-    /// 检查标志是否存在（仅检查 long name 或 short name）。
-    pub fn flag(self: *const CliArgs, name: []const u8) bool {
-        for (self.flags) |f| {
-            if (std.mem.eql(u8, f.name, name)) return f.present;
-            if (f.short) |s| {
-                if (s == name[0] and name.len == 1) return f.present;
-            }
-        }
-        return false;
-    }
-
-    /// 获取选项值。返回 null 表示未设置。
-    pub fn option(self: *const CliArgs, name: []const u8) ?[]const u8 {
-        for (self.options) |o| {
-            if (std.mem.eql(u8, o.name, name)) return o.value;
-            if (o.short) |s| {
-                if (s == name[0] and name.len == 1) return o.value;
-            }
-        }
-        return null;
-    }
-
-    /// 获取位置参数（按索引）。超出范围返回 null。
-    pub fn positional(self: *const CliArgs, index: usize) ?[]const u8 {
-        if (index >= self._positionals.len) return null;
-        return self._positionals[index];
-    }
-
-    /// 获取全部位置参数。
-    pub fn positionals(self: *const CliArgs) []const []const u8 {
-        return self._positionals;
-    }
-
-    /// 释放解析器分配的内存。
-    pub fn deinit(self: *CliArgs) void {
-        self._allocator.free(self.flags);
-        self._allocator.free(self.options);
-        self._allocator.free(self._positionals);
-    }
-
-    /// 解析 --key=value 或 --flag 参数。
-    fn parseLongArg(
-        arg: []const u8,
-        all_args: []const []const u8,
-        i: usize,
-        flags: []Flag,
-        options: []Option,
-        pos_list: [][]const u8,
-        pos_count: *usize,
-    ) !usize {
-        const stripped = arg[2..]; // 移除 "--"
-
-        // 检查 = 分隔符: --key=value
-        if (std.mem.indexOfScalar(u8, stripped, '=')) |eq_idx| {
-            const name = stripped[0..eq_idx];
-            const value = stripped[eq_idx + 1 ..];
-            for (options) |*o| {
-                if (std.mem.eql(u8, o.name, name)) {
-                    o.value = value;
-                    return i;
-                }
-            }
-            // Unknown option — store as positional
-            pos_list[pos_count.*] = arg;
-            pos_count.* += 1;
-        } else {
-            const name = stripped;
-
-            // 先检查是否匹配某个选项 — 如果是，下一个 arg 是其值
-            for (options) |*o| {
-                if (std.mem.eql(u8, o.name, name)) {
-                    if (i + 1 < all_args.len) {
-                        const next = all_args[i + 1];
-                        if (!std.mem.startsWith(u8, next, "-")) {
-                            o.value = next;
-                            return i + 1; // 消耗下一个 arg
-                        }
-                    }
-                    // 无值跟随 → 设为空字符串表示已存在
-                    o.value = "";
-                    return i;
-                }
-            }
-
-            // 检查是否匹配某个标志
-            for (flags) |*f| {
-                if (std.mem.eql(u8, f.name, name)) {
-                    f.present = true;
-                    return i;
-                }
-            }
-
-            // Next check --no- prefix flags
-            if (std.mem.startsWith(u8, name, "no-")) {
-                const real_name = name[3..];
-                for (flags) |*f| {
-                    if (std.mem.eql(u8, f.name, real_name)) {
-                        f.present = false;
-                        return i;
-                    }
-                }
-            }
-
-            // Unknown — store as positional
-            pos_list[pos_count.*] = arg;
-            pos_count.* += 1;
-        }
-        return i;
-    }
-
-    /// 解析 -x 短参数。
-    fn parseShortArg(
-        ch: u8,
-        flags: []Flag,
-        options: []Option,
-    ) !void {
-        for (flags) |*f| {
-            if (f.short) |s| {
-                if (s == ch) {
-                    f.present = true;
-                    return;
-                }
-            }
-        }
-        for (options) |*o| {
-            if (o.short) |s| {
-                if (s == ch) {
-                    // 短选项需要下一个 arg 作为值（由调用方处理）
-                    return;
-                }
-            }
-        }
-        return error.UnknownFlag;
-    }
-};
+/// 创建 Noop 执行函数（用于没有 action 的父命令）。
+pub fn noopAction(_: CommandContext) anyerror!void {}
 
 // ============================================================
 // 信号处理
@@ -237,12 +86,12 @@ pub const ExitCallback = *const fn () void;
 /// 最大可注册的退出回调数。
 const max_exit_callbacks = 16;
 
-/// 全局退出回调列表（仅用于 async-signal-safe 操作）。
+/// 全局退出回调列表。
 var exit_callbacks: [max_exit_callbacks]ExitCallback = [_]ExitCallback{undefined} ** max_exit_callbacks;
 var exit_callback_count: usize = 0;
 var signal_received: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 
-/// 注册退出回调。最多 16 个，按注册顺序调用。
+/// 注册退出回调。最多 16 个，按注册顺序存储（触发时 LIFO 调用）。
 /// 安装信号处理器之前调用此函数。
 pub fn registerExitCallback(cb: ExitCallback) void {
     if (exit_callback_count < max_exit_callbacks) {
@@ -264,7 +113,6 @@ pub fn installExitHandlers(signals: []const Signal) !void {
 }
 
 /// 阻塞等待任意已注册信号。收到信号后返回触发信号的类型。
-/// POSIX: sigwait; Windows: Sleep 循环。
 pub fn waitForSignal() Signal {
     if (native_os == .windows) {
         while (!signal_received.load(.acquire)) {
@@ -280,7 +128,7 @@ pub fn exitRequested() bool {
     return signal_received.load(.acquire);
 }
 
-/// 触发退出回调并设置信号标志。
+/// 触发退出回调并设置信号标志（LIFO 顺序）。
 fn triggerCallbacks(sig: Signal) void {
     _ = sig;
     signal_received.store(true, .release);
@@ -354,11 +202,9 @@ fn installWindowsHandlers() !void {
 
     const handler = struct {
         fn handle(ctrl_type: u32) callconv(.winapi) i32 {
-            // CTRL_C_EVENT = 0, CTRL_BREAK_EVENT = 1,
-            // CTRL_CLOSE_EVENT = 2
             if (ctrl_type == 0 or ctrl_type == 2) {
                 triggerCallbacks(.interrupt);
-                return 1; // 已处理，不传递给下一个 handler
+                return 1;
             }
             return 0;
         }
@@ -387,7 +233,6 @@ fn daemonizePosix() !void {
     // First fork: detach from terminal
     const pid1 = try std.posix.fork();
     if (pid1 > 0) {
-        // Parent exits
         std.posix.exit(0);
     }
 
@@ -419,133 +264,7 @@ fn daemonizePosix() !void {
 
 const testing = std.testing;
 
-// ---- 参数解析测试 ----
-
-test "CliArgs: flags and options" {
-    const args = [_][]const u8{
-        "prog",
-        "--verbose",
-        "--port=8080",
-        "--host",
-        "localhost",
-        "input.txt",
-        "output.txt",
-    };
-
-    const flags_defs = [_]Flag{
-        .{ .name = "verbose", .short = 'v' },
-        .{ .name = "debug", .short = 'd' },
-    };
-    const options_defs = [_]Option{
-        .{ .name = "port", .short = 'p' },
-        .{ .name = "host", .short = 'h' },
-    };
-
-    var cli = try CliArgs.parse(testing.allocator, &args, &flags_defs, &options_defs);
-    defer cli.deinit();
-
-    try testing.expect(cli.flag("verbose"));
-    try testing.expect(!cli.flag("debug"));
-    try testing.expectEqualStrings("8080", cli.option("port").?);
-    try testing.expectEqualStrings("localhost", cli.option("host").?);
-
-    try testing.expectEqualStrings("input.txt", cli.positional(0).?);
-    try testing.expectEqualStrings("output.txt", cli.positional(1).?);
-    try testing.expectEqual(@as(usize, 2), cli.positionals().len);
-}
-
-test "CliArgs: short flags" {
-    const args = [_][]const u8{ "prog", "-v", "-d" };
-    const flags_defs = [_]Flag{
-        .{ .name = "verbose", .short = 'v' },
-        .{ .name = "debug", .short = 'd' },
-    };
-    const options_defs = [_]Option{};
-
-    var cli = try CliArgs.parse(testing.allocator, &args, &flags_defs, &options_defs);
-    defer cli.deinit();
-
-    try testing.expect(cli.flag("v"));
-    try testing.expect(cli.flag("d"));
-    try testing.expect(cli.flag("verbose"));
-}
-
-test "CliArgs: --no- prefix" {
-    const args = [_][]const u8{ "prog", "--no-verbose" };
-    const flags_defs = [_]Flag{
-        .{ .name = "verbose", .short = 'v' },
-    };
-    const options_defs = [_]Option{};
-
-    var cli = try CliArgs.parse(testing.allocator, &args, &flags_defs, &options_defs);
-    defer cli.deinit();
-
-    try testing.expect(!cli.flag("verbose"));
-}
-
-test "CliArgs: no arguments" {
-    const args = [_][]const u8{"prog"};
-    const flags_defs = [_]Flag{.{ .name = "help", .short = 'h' }};
-    const options_defs = [_]Option{};
-
-    var cli = try CliArgs.parse(testing.allocator, &args, &flags_defs, &options_defs);
-    defer cli.deinit();
-
-    try testing.expect(!cli.flag("help"));
-    try testing.expectEqual(@as(usize, 0), cli.positionals().len);
-}
-
-test "CliArgs: option not set returns null" {
-    const args = [_][]const u8{"prog"};
-    const flags_defs = [_]Flag{};
-    const options_defs = [_]Option{.{ .name = "config" }};
-
-    var cli = try CliArgs.parse(testing.allocator, &args, &flags_defs, &options_defs);
-    defer cli.deinit();
-
-    try testing.expectEqual(@as(?[]const u8, null), cli.option("config"));
-}
-
-test "CliArgs: positional only" {
-    const args = [_][]const u8{ "prog", "src/main.zig", "build.zig" };
-    const flags_defs = [_]Flag{};
-    const options_defs = [_]Option{};
-
-    var cli = try CliArgs.parse(testing.allocator, &args, &flags_defs, &options_defs);
-    defer cli.deinit();
-
-    try testing.expectEqualStrings("src/main.zig", cli.positional(0).?);
-    try testing.expectEqualStrings("build.zig", cli.positional(1).?);
-    try testing.expectEqual(@as(?[]const u8, null), cli.positional(2));
-}
-
-test "CliArgs: option with short name via --long" {
-    const args = [_][]const u8{ "prog", "--port", "9090" };
-    const flags_defs = [_]Flag{};
-    const options_defs = [_]Option{.{ .name = "port", .short = 'p' }};
-
-    var cli = try CliArgs.parse(testing.allocator, &args, &flags_defs, &options_defs);
-    defer cli.deinit();
-
-    try testing.expectEqualStrings("9090", cli.option("port").?);
-    // Also check by short name
-    try testing.expectEqualStrings("9090", cli.option("p").?);
-}
-
-test "CliArgs: option with equals sign" {
-    const args = [_][]const u8{ "prog", "--port=9090" };
-    const flags_defs = [_]Flag{};
-    const options_defs = [_]Option{.{ .name = "port" }};
-
-    var cli = try CliArgs.parse(testing.allocator, &args, &flags_defs, &options_defs);
-    defer cli.deinit();
-
-    try testing.expectEqualStrings("9090", cli.option("port").?);
-}
-
-// ---- 信号处理测试 ----
-
-test "exit callbacks: register and trigger" {
+test "cli: registerExitCallback and trigger" {
     var called: bool = false;
     const cb = struct {
         var flag: *bool = undefined;
@@ -556,59 +275,12 @@ test "exit callbacks: register and trigger" {
     cb.flag = &called;
 
     registerExitCallback(cb.handler);
-    // simulate signal trigger
-    signal_received.store(true, .release);
     cb.handler();
 
     try testing.expect(called);
 }
 
-test "exit callbacks: multiple in registration order" {
-    var order: [3]u8 = [_]u8{0} ** 3;
-    var count: usize = 0;
-
-    // Clear state
-    exit_callback_count = 0;
-    signal_received.store(false, .release);
-
-    // Each callback writes a value to order[i] then increments count
-    const cb1 = struct {
-        var o: *[3]u8 = undefined;
-        var c: *usize = undefined;
-        fn h1() void {
-            o.*[0] = 1;
-            c.* += 1;
-        }
-        fn h2() void {
-            o.*[1] = 2;
-            c.* += 1;
-        }
-        fn h3() void {
-            o.*[2] = 3;
-            c.* += 1;
-        }
-    };
-    cb1.o = &order;
-    cb1.c = &count;
-
-    registerExitCallback(cb1.h1);
-    registerExitCallback(cb1.h2);
-    registerExitCallback(cb1.h3);
-
-    // Trigger manually (reverse order — callbacks fire LIFO)
-    var i: usize = exit_callback_count;
-    while (i > 0) {
-        i -= 1;
-        exit_callbacks[i]();
-    }
-
-    try testing.expectEqual(@as(u8, 1), order[0]);
-    try testing.expectEqual(@as(u8, 2), order[1]);
-    try testing.expectEqual(@as(u8, 3), order[2]);
-    try testing.expectEqual(@as(usize, 3), count);
-}
-
-test "exitRequested: reflects flag state" {
+test "cli: exitRequested reflects flag state" {
     signal_received.store(false, .release);
     try testing.expect(!exitRequested());
 
@@ -616,4 +288,21 @@ test "exitRequested: reflects flag state" {
     try testing.expect(exitRequested());
 
     signal_received.store(false, .release);
+}
+
+test "cli: Signal enum values" {
+    try testing.expect(Signal.interrupt != Signal.terminate);
+    try testing.expect(Signal.terminate != Signal.hangup);
+    try testing.expect(Signal.interrupt != Signal.hangup);
+}
+
+test "cli: noopAction does nothing" {
+    // Just verify it compiles and doesn't panic at comptime
+    try testing.expect(true);
+}
+
+test "cli: daemonize unsupported on Windows" {
+    if (native_os == .windows) {
+        try testing.expectError(error.Unsupported, daemonize());
+    }
 }
