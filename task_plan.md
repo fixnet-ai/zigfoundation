@@ -4,7 +4,7 @@
 从 zigproxy/zproxy/zigtun 提取公共组件，实现 13 个工业级基础模块（buffer/ring/endian/platform/net/strings/cli/log/yaml/store/event/queue/socket），100% 单元测试覆盖，五平台支持。
 
 ## Current Phase
-Phase 2
+Phase 3 (std-only 部分完成; yaml 需要 libyaml，移至 Phase 4)
 
 ## Phases
 
@@ -34,16 +34,16 @@ Phase 2
 - [x] `zig build test` 全绿 (86/86)
 - **Status:** complete
 
-### Phase 3: 应用框架（std + libyaml）
-- [ ] `strings.zig` — 从 zproxy/src/utils.zig 提取字符串部分：切割、trim、大小写转换等
-- [ ] `cli.zig` — 新建：命令行参数解析、跨平台信号处理 + 退出回调（SIGINT/SIGTERM/SIGHUP）、守护进程化
-- [ ] `log.zig` — 新建：分级日志（trace/debug/info/warn/err）、多输出后端
-- [ ] `yaml.zig` — 新建：libyaml C 库封装（build.zig 集成编译 + Zig API 接口），不提供任何业务配置结构
-- [ ] foundation.zig 更新导出
-- [ ] `zig build test` 全绿
-- **Status:** pending
+### Phase 3: 应用框架（std only）
+- [x] `strings.zig` — 新建原创模块：大小写转换（toLower/toUpper/toLowerInPlace/toUpperInPlace）、子串搜索（contains/containsIgnoreCase）、前后缀匹配（startsWithIgnoreCase/endsWithIgnoreCase）、拼接（join）、切分（splitLines/splitTrim）。20 tests
+- [x] `cli.zig` — 新建：CliArgs 命令行参数解析（--flag/-f/--key=value/positional）、跨平台信号处理 + 退出回调（SIGINT/SIGTERM/SIGHUP）、守护进程化。~23 tests
+- [x] `log.zig` — 新建：分级日志 Logger（trace/debug/info/warn/err）、WriteFn 回调输出后端、跨平台 stderr/stdout（POSIX write + Windows kernel32）、ANSI 颜色、动态切换级别/后端。10 tests
+- [x] foundation.zig 更新导出
+- [x] `zig build test` 全绿 (134/134)
+- **Status:** complete（yaml.zig 需要 libyaml，移至 Phase 4）
 
-### Phase 4: 存储与并发（std + libxev）
+### Phase 4: 存储、配置与并发（std + libyaml + libxev）
+- [ ] `yaml.zig` — 新建：libyaml C 库封装（build.zig 集成编译 + Zig API 接口），不提供任何业务配置结构
 - [ ] `store.zig` — 从 zigproxy 提取：持久化缓存，路径由调用者传入并初始化，文件读写/原子替换/过期清理。不绑定 DNS
 - [ ] `event.zig` — 从 zproxy/src/core/event.zig (655行) 提取 ResetEvent：跨平台事件通知（Posix + Windows），基于 libxev
 - [ ] `queue.zig` — 从 zproxy/src/core/queue.zig (348行) 提取 CommandQueue + MonitorQueue（MPSC），基于 libxev

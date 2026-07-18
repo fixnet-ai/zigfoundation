@@ -53,13 +53,31 @@
   - src/net.zig (created)
   - src/foundation.zig (updated — barrel export)
 
+### Phase 3: 应用框架（std only）
+- **Status:** complete
+- Actions taken:
+  - 创建 `strings.zig` — 原创模块，补充 std.mem 未提供的字符串工具。toLower/toUpper (alloc)、toLowerInPlace/toUpperInPlace (in-place)、contains/containsIgnoreCase、startsWithIgnoreCase/endsWithIgnoreCase、join (alloc)、splitLines、splitTrim (去空白迭代器)。20 tests
+  - 创建 `cli.zig` — 原创模块。CliArgs 命令行参数解析（--flag/-f/--key=value/positional）、跨平台信号处理 (POSIX sigaction + Windows SetConsoleCtrlHandler)、守护进程化。~23 tests
+  - 创建 `log.zig` — 原创模块。Level 五级枚举、WriteFn 回调模式、跨平台 stderr/stdout（POSIX std.c.write + Windows kernel32）、ANSI 颜色、动态切换级别/后端。10 tests
+  - 修复 log.zig Zig 0.16.0 问题：`std.posix.write` 不存在 → 改用 `std.c.write`；`initTestLogger` 匿名结构体返回类型不匹配 → twWriteFn 工厂函数 + struct-var 模式
+  - 更新 `foundation.zig` — barrel 导出 strings + cli + log
+  - `zig build test` 134/134 全绿 + `zig build` 成功 + `zig fmt --check` 通过
+- Files created/modified:
+  - src/strings.zig (created)
+  - src/cli.zig (created)
+  - src/log.zig (created)
+  - src/foundation.zig (updated — barrel export)
+
 ## Test Results
 | Test | Input | Expected | Actual | Status |
 |------|-------|----------|--------|--------|
 | Phase 1 (28 tests) | ring/buffer/endian | 全绿 | 28/28 passed | ✓ |
 | Phase 2 platform (9 tests) | 平台检测/时间/资源/DNS | 全绿 | 9/9 passed | ✓ |
 | Phase 2 net (49 tests) | IP/验证/CIDR/host:port | 全绿 | 49/49 passed | ✓ |
-| **Total** | **86 tests** | **全绿** | **86/86 passed** | **✓** |
+| Phase 3 strings (20 tests) | 大小写/搜索/拼接/切分 | 全绿 | 20/20 passed | ✓ |
+| Phase 3 cli (~23 tests) | 参数解析/信号/守护进程 | 全绿 | 23/23 passed | ✓ |
+| Phase 3 log (10 tests) | 日志级别/格式化/颜色/后端切换 | 全绿 | 10/10 passed | ✓ |
+| **Total** | **134 tests** | **全绿** | **134/134 passed** | **✓** |
 | zig build | 静态库 | 成功 | 成功 | ✓ |
 | zig fmt --check | 源码格式 | 通过 | 通过 | ✓ |
 
@@ -70,11 +88,11 @@
 ## 5-Question Reboot Check
 | Question | Answer |
 |----------|--------|
-| 我在哪里？ | Phase 2 (平台与网络) 完成 → Phase 3 (应用框架) 即将开始 |
-| 我要去哪里？ | Phase 3 (应用框架: strings/cli/log/yaml) → 4 (存储并发) → 5 (网络出站) → 6 (集成验证) |
+| 我在哪里？ | Phase 3 (应用框架) std-only 部分完成 → Phase 4 (存储/配置/并发) 即将开始 |
+| 我要去哪里？ | Phase 4 (yaml/store/event/queue) → 5 (socket) → 6 (集成验证) |
 | 目标是什么？ | 提取 13 个工业级基础模块（std + libxev + libyaml），100% 测试覆盖，五平台 |
-| 我学到了什么？ | 见 findings.md；net.zig: Zig 0.16.0 std.Io.net.Ip4Address.parse 错误类型因输入而异 (Overflow/Incomplete/InvalidCharacter)；bufPrint 复用同一 buffer 会触发 @memcpy alias panic；isValidHost 对 "256.0.0.0" 会回退到 isValidDomain（行为与 zproxy 一致） |
-| 我做了什么？ | Phase 2 全部完成：platform.zig (9 tests) + net.zig (49 tests) = 86/86 全绿 |
+| 我学到了什么？ | 见 findings.md；log.zig: Zig 0.16.0 `std.posix.write` 不存在 → 用 `std.c.write`；匿名结构体返回类型在 comptime 下不匹配 → 使用 struct-var 模式 + 工厂函数；跨平台 stderr 写：POSIX 用 `std.c.write(2, ...)`，Windows 用 `kernel32.WriteFile(GetStdHandle(STD_ERROR_HANDLE), ...)` |
+| 我做了什么？ | Phase 3 (std only) 全部完成：strings.zig (20 tests) + cli.zig (23 tests) + log.zig (10 tests) = 134/134 全绿 |
 
 ---
 *每个阶段完成或遇到错误后更新此文件*

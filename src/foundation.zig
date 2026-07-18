@@ -27,14 +27,20 @@ pub const endian = @import("endian.zig");
 // ---- Phase 2: 平台与网络 (std only) ----
 pub const platform = @import("platform.zig");
 pub const net = @import("net.zig");
-// pub const strings = @import("strings.zig");   // Phase 3
-// pub const cli = @import("cli.zig");           // Phase 3
-// pub const log = @import("log.zig");           // Phase 3
-// pub const yaml = @import("yaml.zig");         // Phase 3
-// pub const store = @import("store.zig");       // Phase 4
-// pub const event = @import("event.zig");       // Phase 4
-// pub const queue = @import("queue.zig");       // Phase 4
-// pub const socket = @import("socket.zig");     // Phase 5
+
+// ---- Phase 3: 应用框架 (std only) ----
+pub const strings = @import("strings.zig");
+pub const cli = @import("cli.zig");
+pub const log = @import("log.zig");
+
+// ---- Phase 4: 存储、配置与并发 (libyaml + libxev) ----
+// pub const yaml = @import("yaml.zig");
+// pub const store = @import("store.zig");
+// pub const event = @import("event.zig");
+// pub const queue = @import("queue.zig");
+
+// ---- Phase 5: 网络出站 (libxev) ----
+// pub const socket = @import("socket.zig");
 
 test {
     _ = @import("foundation.zig");
@@ -43,4 +49,7 @@ test {
     _ = @import("endian.zig");
     _ = @import("platform.zig");
     _ = @import("net.zig");
+    _ = @import("strings.zig");
+    _ = @import("cli.zig");
+    _ = @import("log.zig");
 }
