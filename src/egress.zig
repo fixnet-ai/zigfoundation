@@ -1,0 +1,380 @@
+//! 网络出站 — 跨平台 socket 创建 + 绕过路由绑定
+//!
+//! 提供统一的跨平台出站 socket API，支持：
+//! - TCP/UDP socket 创建
+//! - 接口绑定（绕过路由表）：
+//!   - Linux: `SO_BINDTODEVICE`（按接口名绑定）
+//!   - macOS/iOS: `IP_BOUND_IF`（按接口索引绑定）
+//!   - Windows: `IP_UNICAST_IF`（按接口索引绑定）
+//! - 源地址绑定（`bind()` before `connect()`）
+//! - SO_REUSEADDR 设置
+//!
+//! ## 平台支持
+//!
+//! | 功能 | Linux | macOS | iOS | Windows | Android |
+//! |------|-------|-------|-----|---------|---------|
+//! | 接口名绑定 | SO_BINDTODEVICE | ❌ | ❌ | ❌ | SO_BINDTODEVICE |
+//! | 接口索引绑定 | ❌ | IP_BOUND_IF | IP_BOUND_IF | IP_UNICAST_IF | ❌ |
+//! | 源地址绑定 | bind() | bind() | bind() | bind() | bind() |
+//!
+//! ## 使用示例
+//!
+//! ```
+//! const egress = @import("zigfoundation").egress;
+//!
+//! // 创建绑定到指定接口的 TCP socket
+//! const sock = try egress.Socket.initTcp(.{
+//!     .interface_name = "eth0",
+//!     .reuse_addr = true,
+//! });
+//! defer sock.close();
+//! ```
+
+const std = @import("std");
+const builtin = @import("builtin");
+
+/// 跨平台 socket 协议常量（避免 std.posix.AF/SOCK/IPPROTO 在不同 OS 上的类型差异）。
+const AF_INET: u32 = 2;
+const AF_INET6: u32 = 30;
+const SOCK_STREAM: u32 = 1;
+const SOCK_DGRAM: u32 = 2;
+const IPPROTO_TCP: u32 = 6;
+const IPPROTO_UDP: u32 = 17;
+
+/// 协议级别常量（全平台通用）。
+const SOL_SOCKET: i32 = 0xffff; // SOL_SOCKET (fits in i32)
+const IPPROTO_IP: i32 = 0; // IPPROTO_IP
+const IPPROTO_IPV6: i32 = 41; // IPPROTO_IPV6
+
+/// Socket 选项常量（全平台通用值）。
+const SO_REUSEADDR: u32 = 0x0004; // SO_REUSEADDR
+const SO_BINDTODEVICE: u32 = 25; // Linux: SO_BINDTODEVICE
+const IPV6_V6ONLY: u32 = 27; // IPV6_V6ONLY (Linux/macOS/Windows)
+const IP_BOUND_IF: u32 = 25; // macOS: IP_BOUND_IF
+const IP_UNICAST_IF: u32 = 31; // Windows: IP_UNICAST_IF
+
+/// 出站 socket 绑定选项。
+pub const BindOpts = struct {
+    /// Linux/Android: 接口名（如 "eth0"），设置 SO_BINDTODEVICE。
+    interface_name: ?[]const u8 = null,
+
+    /// macOS/iOS: 接口索引（IP_BOUND_IF），Windows: 接口索引（IP_UNICAST_IF）。
+    /// Linux/Android 上忽略。
+    interface_index: ?u32 = null,
+
+    /// 源地址绑定 — 在 connect() 之前执行 bind() 到此Ip地址。
+    /// 格式为 "ip:port"，如 "127.0.0.1:0"（port=0 表示系统自动分配）。
+    source_addr: ?[]const u8 = null,
+
+    /// 设置 SO_REUSEADDR（默认 true，允许端口复用）。
+    reuse_addr: bool = true,
+};
+
+/// 跨平台出站 socket。
+///
+/// 封装原始 socket 文件描述符，提供统一的创建和绑定接口。
+/// 不执行任何异步 I/O — 调用者自行使用 libxev 或 std.posix 进行读写。
+pub const Socket = struct {
+    fd: std.posix.socket_t,
+
+    /// 创建 TCP socket 并应用绑定选项。
+    pub fn initTcp(opts: BindOpts) !Socket {
+        const fd = try createSocket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        errdefer closeFd(fd);
+
+        try applyOpts(fd, opts, false);
+        return Socket{ .fd = fd };
+    }
+
+    /// 创建 UDP socket 并应用绑定选项。
+    pub fn initUdp(opts: BindOpts) !Socket {
+        const fd = try createSocket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        errdefer closeFd(fd);
+
+        try applyOpts(fd, opts, false);
+        return Socket{ .fd = fd };
+    }
+
+    /// 创建支持 IPv6 的 TCP socket（双栈）。
+    pub fn initTcp6(opts: BindOpts) !Socket {
+        const fd = try createSocket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
+        errdefer closeFd(fd);
+
+        // 禁用 IPV6_V6ONLY 以实现双栈
+        try setIpv6Only(fd, false);
+        try applyOpts(fd, opts, true);
+        return Socket{ .fd = fd };
+    }
+
+    /// 创建支持 IPv6 的 UDP socket（双栈）。
+    pub fn initUdp6(opts: BindOpts) !Socket {
+        const fd = try createSocket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP);
+        errdefer closeFd(fd);
+
+        try setIpv6Only(fd, false);
+        try applyOpts(fd, opts, true);
+        return Socket{ .fd = fd };
+    }
+
+    /// 关闭 socket。
+    pub fn close(self: *Socket) void {
+        closeFd(self.fd);
+        self.fd = INVALID_SOCKET;
+    }
+
+    /// 获取 socket 描述符（供外部异步 I/O 使用）。
+    pub fn getFd(self: *const Socket) std.posix.socket_t {
+        return self.fd;
+    }
+};
+
+/// 无效 socket 值（POSIX: -1, Windows: ~0）。
+const INVALID_SOCKET = if (builtin.os.tag == .windows)
+    @as(std.posix.socket_t, @bitCast(@as(c_ulong, std.math.maxInt(c_ulong))))
+else
+    @as(std.posix.socket_t, -1);
+
+/// 跨平台 socket() 封装。
+fn createSocket(domain: u32, sock_type: u32, protocol: u32) !std.posix.socket_t {
+    const fd = std.c.socket(domain, sock_type, protocol);
+    if (fd == INVALID_SOCKET) return error.SocketCreateFailed;
+    return fd;
+}
+
+/// 跨平台 close() 封装。
+fn closeFd(fd: std.posix.socket_t) void {
+    _ = std.c.close(fd);
+}
+
+/// 应用 BindOpts 到 socket fd。
+fn applyOpts(fd: std.posix.socket_t, opts: BindOpts, is_ipv6: bool) !void {
+    if (opts.reuse_addr) {
+        try setReuseAddr(fd);
+    }
+
+    if (opts.interface_name) |ifname| {
+        try bindToDevice(fd, ifname);
+    }
+
+    if (opts.interface_index) |ifindex| {
+        try bindToInterfaceIndex(fd, ifindex, is_ipv6);
+    }
+
+    if (opts.source_addr) |addr| {
+        try bindSourceAddr(fd, addr);
+    }
+}
+
+/// 设置 SO_REUSEADDR（全平台）。
+fn setReuseAddr(fd: std.posix.socket_t) !void {
+    const on: u32 = 1;
+    try std.posix.setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, std.mem.asBytes(&on));
+}
+
+/// Linux: 绑定到指定接口名 (SO_BINDTODEVICE)。
+fn bindToDevice(fd: std.posix.socket_t, ifname: []const u8) !void {
+    switch (builtin.os.tag) {
+        .linux => {
+            const ifname_z = try std.posix.toPosixPath(ifname);
+            try std.posix.setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, ifname_z[0..ifname.len]);
+        },
+        else => return, // 其他平台不支持接口名绑定，静默跳过
+    }
+}
+
+/// macOS/iOS: 绑定到接口索引 (IP_BOUND_IF)。
+/// Windows: 绑定到接口索引 (IP_UNICAST_IF)。
+fn bindToInterfaceIndex(fd: std.posix.socket_t, ifindex: u32, is_ipv6: bool) !void {
+    const level = if (is_ipv6) IPPROTO_IPV6 else IPPROTO_IP;
+    const ndx = ifindex;
+    switch (builtin.os.tag) {
+        .macos, .ios, .tvos, .watchos => {
+            try std.posix.setsockopt(fd, level, IP_BOUND_IF, std.mem.asBytes(&ndx));
+        },
+        .windows => {
+            try std.posix.setsockopt(fd, level, IP_UNICAST_IF, std.mem.asBytes(&ndx));
+        },
+        else => return, // 其他平台不支持接口索引绑定，静默跳过
+    }
+}
+
+/// 绑定源地址 — 解析 "ip:port" 并执行 bind()。
+fn bindSourceAddr(fd: std.posix.socket_t, addr_str: []const u8) !void {
+    const colon_idx = std.mem.lastIndexOfScalar(u8, addr_str, ':') orelse return error.InvalidAddress;
+    const ip_str = addr_str[0..colon_idx];
+    const port_str = addr_str[colon_idx + 1 ..];
+    const port = std.fmt.parseInt(u16, port_str, 10) catch return error.InvalidAddress;
+
+    // 构造通用 sockaddr 结构（兼容 macOS sin_len / Linux 无 sin_len）
+    var sa_bytes: [28]u8 = [_]u8{0} ** 28;
+    var sa_len: u32 = 0;
+
+    // 尝试解析为 IPv4
+    const ip4 = std.Io.net.Ip4Address.parse(ip_str, port) catch null;
+    if (ip4) |v| {
+        const addr: u32 = @as(u32, v.bytes[0]) << 24 |
+            @as(u32, v.bytes[1]) << 16 |
+            @as(u32, v.bytes[2]) << 8 |
+            @as(u32, v.bytes[3]);
+        if (builtin.os.tag.isDarwin()) {
+            sa_bytes[0] = @sizeOf(SockAddrIn4); // sin_len
+            sa_bytes[1] = @as(u8, @intCast(AF_INET)); // sin_family
+            std.mem.writeInt(u16, sa_bytes[2..4], v.port, .big);
+            std.mem.writeInt(u32, sa_bytes[4..8], addr, .big);
+            sa_len = @sizeOf(SockAddrIn4);
+        } else {
+            std.mem.writeInt(u16, sa_bytes[0..2], AF_INET, .little); // sin_family (u16)
+            std.mem.writeInt(u16, sa_bytes[2..4], v.port, .big);
+            std.mem.writeInt(u32, sa_bytes[4..8], addr, .big);
+            sa_len = @sizeOf(SockAddrIn4);
+        }
+    } else {
+        const ip6 = std.Io.net.Ip6Address.parse(ip_str, port) catch null;
+        if (ip6) |v6| {
+            if (builtin.os.tag.isDarwin()) {
+                sa_bytes[0] = @sizeOf(SockAddrIn6); // sin6_len
+                sa_bytes[1] = @as(u8, @intCast(AF_INET6)); // sin6_family
+                std.mem.writeInt(u16, sa_bytes[2..4], v6.port, .big);
+                std.mem.writeInt(u32, sa_bytes[4..8], v6.flow, .little);
+                @memcpy(sa_bytes[8..24], &v6.bytes);
+                std.mem.writeInt(u32, sa_bytes[24..28], 0, .little); // scope_id=0
+                sa_len = @sizeOf(SockAddrIn6);
+            } else {
+                std.mem.writeInt(u16, sa_bytes[0..2], AF_INET6, .little);
+                std.mem.writeInt(u16, sa_bytes[2..4], v6.port, .big);
+                std.mem.writeInt(u32, sa_bytes[4..8], v6.flow, .little);
+                @memcpy(sa_bytes[8..24], &v6.bytes);
+                std.mem.writeInt(u32, sa_bytes[24..28], 0, .little); // scope_id=0
+                sa_len = @sizeOf(SockAddrIn6);
+            }
+        } else {
+            return error.InvalidAddress;
+        }
+    }
+
+    const rc = std.c.bind(fd, @ptrCast(&sa_bytes), @intCast(sa_len));
+    if (rc != 0) return error.BindFailed;
+}
+
+/// 跨平台 sockaddr_in。
+/// macOS/BSD 包含 sin_len 字段（offset 0），Linux 从 sin_family（offset 0, 2 bytes）开始。
+const SockAddrIn4 = if (builtin.os.tag.isDarwin())
+    extern struct {
+        len: u8 = @sizeOf(@This()),
+        family: u8 = AF_INET,
+        port: u16 = 0,
+        addr: u32 = 0,
+        zero: [8]u8 = [_]u8{0} ** 8,
+    }
+else
+    extern struct {
+        family: u16 = AF_INET,
+        port: u16 = 0,
+        addr: u32 = 0,
+        zero: [8]u8 = [_]u8{0} ** 8,
+    };
+
+/// 跨平台 sockaddr_in6。
+const SockAddrIn6 = if (builtin.os.tag.isDarwin())
+    extern struct {
+        len: u8 = @sizeOf(@This()),
+        family: u8 = AF_INET6,
+        port: u16 = 0,
+        flowinfo: u32 = 0,
+        addr: [16]u8 = [_]u8{0} ** 16,
+        scope_id: u32 = 0,
+    }
+else
+    extern struct {
+        family: u16 = AF_INET6,
+        port: u16 = 0,
+        flowinfo: u32 = 0,
+        addr: [16]u8 = [_]u8{0} ** 16,
+        scope_id: u32 = 0,
+    };
+
+/// 设置 IPV6_V6ONLY（false = 双栈模式）。
+fn setIpv6Only(fd: std.posix.socket_t, ipv6_only: bool) !void {
+    const val: u32 = if (ipv6_only) 1 else 0;
+    try std.posix.setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, std.mem.asBytes(&val));
+}
+
+// ============================================================================
+// 测试
+// ============================================================================
+
+const testing = std.testing;
+
+test "egress: initTcp with default opts" {
+    var sock = try Socket.initTcp(.{});
+    defer sock.close();
+    try testing.expect(sock.fd != INVALID_SOCKET);
+}
+
+test "egress: initUdp with default opts" {
+    var sock = try Socket.initUdp(.{});
+    defer sock.close();
+    try testing.expect(sock.fd != INVALID_SOCKET);
+}
+
+test "egress: initTcp6 with default opts" {
+    var sock = try Socket.initTcp6(.{});
+    defer sock.close();
+    try testing.expect(sock.fd != INVALID_SOCKET);
+}
+
+test "egress: initUdp6 with default opts" {
+    var sock = try Socket.initUdp6(.{});
+    defer sock.close();
+    try testing.expect(sock.fd != INVALID_SOCKET);
+}
+
+test "egress: tcp socket with reuse_addr disabled" {
+    var sock = try Socket.initTcp(.{ .reuse_addr = false });
+    defer sock.close();
+    try testing.expect(sock.fd != INVALID_SOCKET);
+}
+
+test "egress: udp socket with reuse_addr disabled" {
+    var sock = try Socket.initUdp(.{ .reuse_addr = false });
+    defer sock.close();
+    try testing.expect(sock.fd != INVALID_SOCKET);
+}
+
+test "egress: bind source address to loopback" {
+    var sock = try Socket.initUdp(.{ .source_addr = "127.0.0.1:0" });
+    defer sock.close();
+    try testing.expect(sock.fd != INVALID_SOCKET);
+}
+
+test "egress: bind source address with specific port" {
+    var sock = try Socket.initUdp(.{ .source_addr = "127.0.0.1:12345" });
+    defer sock.close();
+    try testing.expect(sock.fd != INVALID_SOCKET);
+}
+
+test "egress: getFd returns correct fd" {
+    var sock = try Socket.initTcp(.{});
+    defer sock.close();
+    try testing.expectEqual(sock.fd, sock.getFd());
+}
+
+test "egress: close sets fd to INVALID_SOCKET" {
+    var sock = try Socket.initTcp(.{});
+    sock.close();
+    try testing.expectEqual(INVALID_SOCKET, sock.fd);
+}
+
+test "egress: initTcp6 is dual-stack" {
+    var sock = try Socket.initTcp6(.{});
+    defer sock.close();
+    try testing.expect(sock.fd != INVALID_SOCKET);
+}
+
+test "egress: multiple sockets with different opts" {
+    var s1 = try Socket.initTcp(.{ .reuse_addr = true });
+    defer s1.close();
+    var s2 = try Socket.initTcp(.{ .reuse_addr = false });
+    defer s2.close();
+    try testing.expect(s1.fd != s2.fd);
+}

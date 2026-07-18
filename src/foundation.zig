@@ -4,7 +4,7 @@
 //! - 内存管理 (buffer, ring)
 //! - 大小端转换 (endian)
 //! - 平台抽象 (platform)
-//! - 网络工具 (net, socket)
+//! - 网络工具 (net, egress)
 //! - 字符串处理 (strings)
 //! - 应用框架 (cli, log, yaml)
 //! - 存储框架 (store)
@@ -34,13 +34,13 @@ pub const cli = @import("cli.zig");
 pub const log = @import("log.zig");
 
 // ---- Phase 4: 存储、配置与并发 (libyaml + libxev) ----
-// pub const yaml = @import("yaml.zig");
-// pub const store = @import("store.zig");
-// pub const event = @import("event.zig");
-// pub const queue = @import("queue.zig");
+pub const yaml = @import("yaml.zig");
+pub const store = @import("store.zig");
+pub const event = @import("event.zig");
+pub const queue = @import("queue.zig");
 
-// ---- Phase 5: 网络出站 (libxev) ----
-// pub const socket = @import("socket.zig");
+// ---- Phase 5: 网络出站 (std + libxev) ----
+pub const egress = @import("egress.zig");
 
 test {
     _ = @import("foundation.zig");
@@ -52,4 +52,9 @@ test {
     _ = @import("strings.zig");
     _ = @import("cli.zig");
     _ = @import("log.zig");
+    _ = @import("yaml.zig");
+    _ = @import("store.zig");
+    _ = @import("event.zig");
+    _ = @import("queue.zig");
+    _ = @import("egress.zig");
 }

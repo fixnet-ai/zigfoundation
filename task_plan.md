@@ -1,10 +1,10 @@
 # Task Plan: zigfoundation — fixnet 生态基础库实现
 
 ## Goal
-从 zigproxy/zproxy/zigtun 提取公共组件，实现 13 个工业级基础模块（buffer/ring/endian/platform/net/strings/cli/log/yaml/store/event/queue/socket），100% 单元测试覆盖，五平台支持。
+从 zigproxy/zproxy/zigtun 提取公共组件，实现 13 个工业级基础模块（buffer/ring/endian/platform/net/strings/cli/log/yaml/store/event/queue/egress），100% 单元测试覆盖，五平台支持。
 
 ## Current Phase
-Phase 3 (std-only 部分完成; yaml 需要 libyaml，移至 Phase 4)
+Phase 6 (集成验证)
 
 ## Phases
 
@@ -43,32 +43,32 @@ Phase 3 (std-only 部分完成; yaml 需要 libyaml，移至 Phase 4)
 - **Status:** complete（yaml.zig 需要 libyaml，移至 Phase 4）
 
 ### Phase 4: 存储、配置与并发（std + libyaml + libxev）
-- [ ] `yaml.zig` — 新建：libyaml C 库封装（build.zig 集成编译 + Zig API 接口），不提供任何业务配置结构
-- [ ] `store.zig` — 从 zigproxy 提取：持久化缓存，路径由调用者传入并初始化，文件读写/原子替换/过期清理。不绑定 DNS
-- [ ] `event.zig` — 从 zproxy/src/core/event.zig (655行) 提取 ResetEvent：跨平台事件通知（Posix + Windows），基于 libxev
-- [ ] `queue.zig` — 从 zproxy/src/core/queue.zig (348行) 提取 CommandQueue + MonitorQueue（MPSC），基于 libxev
-- [ ] foundation.zig 更新导出
-- [ ] `zig build test` 全绿
-- **Status:** pending
+- [x] `yaml.zig` — 新建：libyaml C 库封装（build.zig addTranslateC + addCSourceFiles 编译 yaml_document_t API + Zig 友好 Node 导航接口）。12 tests
+- [x] `store.zig` — 从 zigproxy 提取：持久化缓存，路径由调用者传入并初始化，文件读写/原子替换/过期清理。不绑定 DNS。Zig 0.16.0 Io.Dir API 适配。12 tests
+- [x] `event.zig` — 从 zproxy/src/core/event.zig (655行) 提取 ResetEvent：跨平台事件通知（POSIX pthread + Windows SRWLOCK），不含 MainEvent。7 tests
+- [x] `queue.zig` — 从 zproxy/src/core/queue.zig (348行) 提取并泛化为 Queue(T, comptime capacity)：MPSC 环形缓冲区 + mutex + ResetEvent。7 tests
+- [x] foundation.zig 更新导出（yaml/store/event/queue）
+- [x] `zig build test` 161/161 全绿
+- **Status:** complete
 
 ### Phase 5: 网络出站（std + libxev）
-- [ ] `socket.zig` — 网络出站 + 绕过路由绑定：跨平台 socket 接口绑定（`SO_BINDTODEVICE` / `IP_BOUND_IF` / `IP_UNICAST_IF`）、源地址绑定、出站路由策略
-- [ ] foundation.zig 更新导出
-- [ ] `zig build test` 全绿
-- **Status:** pending
+- [x] `egress.zig` — 网络出站 + 绕过路由绑定：跨平台 socket 接口绑定（`SO_BINDTODEVICE` / `IP_BOUND_IF` / `IP_UNICAST_IF`）、源地址绑定、出站路由策略。12 tests
+- [x] foundation.zig 更新导出（egress）
+- [x] `zig build test` 173/173 全绿
+- **Status:** complete
 
 ### Phase 6: 集成验证
-- [ ] 全量测试 `zig build test` 100% 通过
-- [ ] `zig fmt --check` 通过
-- [ ] API.md 替换 TBD 占位为实际 API 文档
+- [x] 全量测试 `zig build test` 173/173 100% 通过
+- [x] `zig fmt --check` 通过
+- [x] API.md 替换 TBD 占位为实际 API 文档（13 模块完整 API 参考）
 - [ ] 兄弟项目（zigtun/zigproxy）切换为依赖 zigfoundation，验证编译通过
-- **Status:** pending
+- **Status:** in_progress
 
 ## Key Questions
 1. ring.zig 选 zigproxy 简化版 (199行) 还是 zproxy 完整版 (602行)？后者含跨平台同步原语
 2. endian 封装粒度：只封 readInt 还是连 writeInt 一起？
 3. yaml.zig 的 libyaml 是系统库还是 vendor 捆绑？
-4. socket.zig 的绕过路由绑定在 iOS/Android 上受限（无 SO_BINDTODEVICE），如何降级？
+4. egress.zig 的绕过路由绑定在 iOS/Android 上受限（无 SO_BINDTODEVICE），如何降级？
 
 ## Decisions Made
 | Decision | Rationale |
@@ -77,7 +77,7 @@ Phase 3 (std-only 部分完成; yaml 需要 libyaml，移至 Phase 4)
 | 依赖分层：std only → std+libyaml → std+libxev | 明确各模块的外部依赖，按依赖递增编排阶段 |
 | ring 而非 ringbuf | Zig 惯用短名（std.RingBuffer 前例），导出类型仍为 `RingBuf` |
 | yaml 而非 config | 只封装 libyaml，不承载业务配置，名字诚实 |
-| socket 而非 egress | 出站路由绑定本质是 socket 层操作，对开发者更直观 |
+| egress 而非 socket | 出站路由绑定本质是网络出站层操作，egress 更准确表达意图 |
 | store 路径由调用者传入 | 注入模式，模块不持有全局状态 |
 | 不含 DNS | 应用层协议，不属于基础库 |
 | 不含 checksum | 不提供 |

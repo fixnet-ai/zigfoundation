@@ -10,6 +10,7 @@ Thumbs.db
 # Build artifacts
 zig-out/
 .zig-cache/
+zig-pkg/
 
 # Claude Code
 .claude/
