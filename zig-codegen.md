@@ -164,6 +164,67 @@ fn factory(comptime value: []const u8) FnPtr {
 }
 ```
 
+**变体：运行时可变指针传递** — 当值必须是运行时可变时，用 struct-level `var` 指针：
+
+```zig
+// ❌ 错误: mutable local not accessible from struct namespace
+fn makeWriteFn(tw: *TestWriter) WriteFn {
+    return struct {
+        fn w(bytes: []const u8) !usize {
+            return tw.write(bytes);  // 编译失败
+        }
+    }.w;
+}
+
+// ✅ 正确: struct-level var + 工厂函数设指针
+fn makeWriteFn(tw: *TestWriter) WriteFn {
+    const S = struct {
+        var p: *TestWriter = undefined;
+        fn w(bytes: []const u8) !usize {
+            return p.write(bytes);
+        }
+    };
+    S.p = tw;
+    return S.w;
+}
+```
+
+### 1.12 `@EnumLiteral()` — 替代 `@Type(.enum_literal)`
+
+Zig 0.16.0 移除 `@Type`，`@EnumLiteral()` 是新的内置函数，用于声明编译期 enum literal 参数：
+
+```zig
+// ❌ 已移除
+comptime scope: @Type(.enum_literal),
+
+// ✅ 替代
+comptime scope: @EnumLiteral(),
+```
+
+`std.log.logFn` 的签名在 0.16.0 中为：
+```zig
+logFn: fn (
+    comptime message_level: log.Level,
+    comptime scope: @EnumLiteral(),
+    comptime format: []const u8,
+    args: anytype,
+) void
+```
+
+### 1.13 `zig fetch` — 添加远程依赖
+
+```bash
+# 添加 GitHub 依赖（自动更新 build.zig.zon 的 .dependencies 和 .hash）
+zig fetch --save=zli https://github.com/xcaeser/zli/archive/refs/heads/main.tar.gz
+```
+
+之后在 `build.zig` 中通过 `b.dependency()` 获取模块：
+```zig
+const zli_dep = b.dependency("zli", .{});
+const zli_module = zli_dep.module("zli");
+lib_module.addImport("zli", zli_module);
+```
+
 ### 1.12 模块名 import vs 文件路径 import 歧义
 
 当 `build.zig` 注册了模块名 `X` 指向 `src/X/mod.zig`，且 root module 中同时存在 `src/X/mod.zig`：
@@ -373,6 +434,42 @@ extern "c" fn recv(fd: c_int, buf: [*]u8, len: usize, flags: c_int) isize;
 ```zig
 errdefer _ = posix.system.close(fd);
 ```
+
+`std.posix.write` 也已移除。跨平台写 stderr/stdout 需自行处理：
+
+```zig
+// POSIX: 直接用 C write
+const n = std.c.write(2, bytes.ptr, bytes.len);  // fd=2 → stderr
+
+// Windows: kernel32 WriteFile
+const STD_ERROR_HANDLE: u32 = @bitCast(@as(i32, -12));
+const h = kernel32.GetStdHandle(STD_ERROR_HANDLE) orelse return error.WriteFailed;
+var written: u32 = 0;
+_ = kernel32.WriteFile(h, bytes.ptr, @intCast(bytes.len), &written, null);
+```
+
+### 3.6.1 `std.Io.getStdErr()` / `std.c.stderr` 已移除
+
+Zig 0.16.0 移除了 `std.Io.getStdErr()`、`std.Io.getStdOut()` 和 `std.c.stderr`/`std.c.stdout` 常量。
+不要使用这些 API，改用上方的 `std.c.write` 或 kernel32 模式。
+
+### 3.6.2 `std.Io.Writer` 无 `.context` 字段
+
+Zig 0.16.0 的 `Writer` 使用 vtable 模式（`vtable: *const VTable, buffer: []u8, end: usize`），
+不再有 `.context`/`.writeFn` 字段。需要自定义输出后端时，推荐用回调函数模式：
+
+```zig
+pub const WriteFn = *const fn (bytes: []const u8) anyerror!usize;
+```
+
+### 3.6.3 `std.log.Level` 仅含四级
+
+Zig 0.16.0 的 `std.log.Level` 仅包含 `err` / `warn` / `info` / `debug` 四个级别，
+没有 `trace`、`emerg`、`alert`、`crit`、`notice`。
+
+级别整数值：`debug(3) > info(2) > warn(1) > err(0)`，值越大越详细。
+过滤逻辑：`if (@intFromEnum(msg_level) > @intFromEnum(threshold)) return;` —
+设置 `.info` 时显示 err/warn/info，隐藏 debug。
 
 ### 3.7 errno 处理
 
@@ -681,6 +778,48 @@ fn posixSignalHandler(sig: std.c.SIG) callconv(.c) void {
 }
 ```
 
+### 8.1.1 跨平台日志 FFI
+
+Android 用 `__android_log_write`（logcat），iOS/macOS 用 `syslog`：
+
+```zig
+// Android — logcat 输出
+extern fn __android_log_write(prio: c_int, tag: [*]const u8, text: [*]const u8) c_int;
+
+// 优先级映射：err→3(ERROR), warn→4(WARN), info→5(INFO), debug→6(DEBUG)
+
+// iOS / macOS — syslog 输出
+extern fn syslog(priority: c_int, format: [*]const u8, ...) void;
+
+// 优先级映射：err→3(LOG_ERR), warn→4(LOG_WARNING), info→6(LOG_INFO), debug→7(LOG_DEBUG)
+```
+
+桌面端（Linux/Windows）直接用 `std.c.write(2, ...)` 写 stderr 或 kernel32 `WriteFile`。
+
+注意：`std.heap.page_allocator` 非线程安全，在日志路径中仅用于临时格式化（用完即 free），不适合高频并发场景。
+
+### 8.1.2 `std_options.logFn` 覆盖全局日志
+
+在根文件中设置 `pub const std_options` 可覆盖 `std.log` 的全部默认行为：
+
+```zig
+// main.zig
+pub const std_options: std.Options = .{
+    .logFn = myLogImpl,
+};
+
+fn myLogImpl(
+    comptime level: std.log.Level,
+    comptime scope: @EnumLiteral(),
+    comptime fmt: []const u8,
+    args: anytype,
+) void {
+    // 自定义输出逻辑
+}
+```
+
+`std_options` 是编译期全局常量，每个二进制只能设置一次。
+
 ### 8.2 `SA_SIGINFO` 不能与 1-arg handler 共用
 
 `SA.SIGINFO` 请求 3-arg handler，单 arg handler 只需要 `SA.RESTART`。
@@ -893,8 +1032,12 @@ while (i > 0) {
 | `capture 'err' shadows function parameter` | 内外层同名 | 重命名内层捕获 |
 | `error union is discarded` | `_ = func()` 不处理错误 | 加 `catch` |
 | `import of file outside module path` | `@import("../x.zig")` | 用 build.zig 的 module+import |
+| `invalid builtin function: '@Type'` | 旧 `@Type(.enum_literal)` | 改用 `@EnumLiteral()` |
+| `enum 'log.Level' has no member named 'trace'` | 使用了 0.16 不存在的级别 | 仅用 err/warn/info/debug |
+| `mutable local not accessible from struct namespace` | comptime 闭包不能捕获运行时可变指针 | 用 struct-level `var` + 工厂函数 |
 
 ---
 
 *最后更新: 2026-07-18*
 *来源: 从 zigtun/zigproxy/zproxy/zigbox 的 zig-codegen.md 提取合并*
+*本次新增: log.zig/cli.zig 重写 — Zig 0.16.0 I/O、日志、FFI、zli 集成经验*
