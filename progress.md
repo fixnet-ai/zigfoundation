@@ -1,5 +1,14 @@
 # Progress Log
 
+## 2026-07-20: fdconn.zig 独立模块 — FdStream 提取
+
+- 将 `FdStream` 从 `src/relay.zig` 移出到新建 `src/fdconn.zig`
+- 原因：FdStream 为 relay/memconn 等多模块所需，位于 relay 中引致循环依赖
+- relay.zig 添加 `const fdconn = @import("fdconn.zig")`，测试更新引用
+- foundation.zig 新增 `pub const fdconn` 导出 + 测试引用
+- API.md 新增 fdconn.zig 章节（适配规则表 + API + 示例），relay 章节同步更新
+- 测试：239/239 ✅（新增 fdconn 2 tests）
+
 ## 2026-07-20: 文档矛盾修复 + log.zig 增强 + Linux VM 测试
 
 - 修复 6 个文档/注释矛盾点（memconn/foundation/buffer/log/README）

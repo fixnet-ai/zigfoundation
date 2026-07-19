@@ -302,3 +302,15 @@ Completion 在回调触发前释放 = use-after-free。
 - `comptime-known if`（`builtin.os.tag == .windows`）能正确剪枝 POSIX 代码，但 `_ =` 抛弃检查发生在剪枝前。不加 `_ =` 直接 `return false;` 即可。
 
 验证: `zig build test-build -Dtarget=aarch64-windows-gnu` → PE32+ AArch64 4.0MB ✅
+
+### fdconn.zig 独立模块 — 循环依赖预防 (2026-07-20)
+
+**问题**: `FdStream` 适配 libxev fd 系流类型为统一 Stream 接口，relay.zig 和 memconn.zig 等多模块均需引用。若留于 relay.zig 内，任何需适配 fd 流的代码都需 import relay，形成不必要的依赖链。
+
+**决策**: 将 `FdStream` 提取到独立 `src/fdconn.zig` 模块。fdconn 仅依赖 `xev`，不依赖任何 zigfoundation 内部模块，位于依赖图最底端。relay.zig 改为 `const fdconn = @import("fdconn.zig")` 引用。
+
+**影响**:
+- 新增 `src/fdconn.zig`（~130 行，含 2 tests）
+- foundation.zig 新增 `pub const fdconn` 导出
+- 模块数: 15 → 16，测试数: 237 → 239
+- API.md 新增 fdconn.zig 完整文档章节

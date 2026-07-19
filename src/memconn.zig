@@ -299,9 +299,12 @@ pub const MemStream = struct {
         self.self_write_async.wait(loop, c, S, op, S.internalCb);
     }
 
-    /// 异步关闭端点。
+    /// 同步关闭端点。
     ///
-    /// 设置关闭标志，通知对端。完成时回调 cb。
+    /// 设置关闭标志，通知对端，同步调用回调。
+    /// 因为 memconn 是纯内存操作，无需异步等待内核资源释放，
+    /// 也不需要注册 async.wait()——避免与 pending read 在 self_read_async 上冲突。
+    ///
     /// cb: fn (?*Userdata, *xev.Loop, *xev.Completion, void) xev.CallbackAction
     pub fn close(
         self: *const MemStream,
@@ -316,9 +319,9 @@ pub const MemStream = struct {
             r: void,
         ) xev.CallbackAction,
     ) void {
-        // 幂等关闭：若已关闭则同步完成，避免在同一 Async 上注册多个 Completion。
+        // 幂等关闭：若已关闭则同步完成。
         // Registry 模式下，不同 MemStream 共享同一 closed 标志，因此后关闭的
-        // 连接在此处释放其引用计数（先关闭的连接在 CloseOp.internalCb 中释放）。
+        // 连接在此处释放其引用计数。
         if (self.closed.load(.acquire)) {
             _ = cb(userdata, loop, c, {});
             if (self._close_releases) {
@@ -336,20 +339,20 @@ pub const MemStream = struct {
         self.peer_read_async.notify() catch {};
         self.peer_write_async.notify() catch {};
 
-        const S = CloseOp(Userdata, cb);
-        const op = self.allocator.create(S) catch {
-            // OOM 时直接回调
-            _ = cb(userdata, loop, c, {});
-            return;
-        };
-        op.* = .{
-            .allocator = self.allocator,
-            .memconn = self.*,
-            .userdata = userdata,
-        };
-
+        // 通知 self_read_async：唤醒本端点上的 pending read（使其看到 closed 标志）
         self.self_read_async.notify() catch {};
-        self.self_read_async.wait(loop, c, S, op, S.internalCb);
+
+        // 同步调用回调 — 纯内存操作无需异步
+        _ = cb(userdata, loop, c, {});
+
+        // Registry 模式（_close_releases=true）下释放引用计数
+        if (self._close_releases) {
+            if (self._shared_release) |rfn| {
+                if (self._shared) |ptr| {
+                    rfn(ptr);
+                }
+            }
+        }
     }
 
     pub fn isClosed(self: *const MemStream) bool {
@@ -535,45 +538,6 @@ fn WriteOp(comptime Userdata: type, comptime cb: anytype) type {
 
             // 缓冲区满，等待对端消费
             return .rearm;
-        }
-    };
-}
-
-fn CloseOp(comptime Userdata: type, comptime cb: anytype) type {
-    return struct {
-        const Self = @This();
-
-        allocator: std.mem.Allocator,
-        memconn: MemStream,
-        userdata: ?*Userdata,
-
-        fn internalCb(
-            ud: ?*Self,
-            loop: *xev.Loop,
-            c: *xev.Completion,
-            r: xev.Async.WaitError!void,
-        ) xev.CallbackAction {
-            const self = ud.?;
-            _ = r catch {};
-
-            const action = cb(self.userdata, loop, c, {});
-            // 先捕获释放所需字段，再释放 self (CloseOp)
-            const close_releases = self.memconn._close_releases;
-            const release_fn = self.memconn._shared_release;
-            const shared = self.memconn._shared;
-            self.allocator.destroy(self);
-
-            // 仅在 Registry 模式（_close_releases=true）下释放 shared state
-            // PairHandle.destroy() 负责统一释放
-            if (close_releases) {
-                if (release_fn) |rfn| {
-                    if (shared) |ptr| {
-                        rfn(ptr);
-                    }
-                }
-            }
-
-            return action;
         }
     };
 }

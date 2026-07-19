@@ -1,8 +1,8 @@
 # zigfoundation API 参考
 
-> **状态**: 14 模块全部实现，232 tests 全绿
+> **状态**: 16 模块全部实现，239 tests 全绿
 >
-> 版本: 0.1.0 | 目标平台: Windows / macOS / Linux / iOS / Android
+> 版本: 0.1.8 | 目标平台: Windows / macOS / Linux / iOS / Android
 >
 > 依赖: Zig std + zli + libyaml C 库 + libxev | 构建: Zig 0.16.0
 
@@ -715,7 +715,7 @@ pub const Registry = struct {
 | `write` | `fn (self, loop, c, buf, Userdata, userdata, cb) void` | 异步写 — 尽力写入全部数据，中间满时自动 re-arm 等待 |
 | `readDirect` | `fn (self, loop, c, Userdata, userdata, cb) void` | **零拷贝读** — 回调直接接收 RingBuf 内部切片，跳过中间拷贝 |
 | `writeDirect` | `fn (self, loop, c, n, Userdata, userdata, cb) void` | **零拷贝写** — 回调直接接收 RingBuf 可写切片，跳过中间拷贝 |
-| `close` | `fn (self, loop, c, Userdata, userdata, cb) void` | 异步关闭 — 设置关闭标志，通知对端。幂等（可安全多次调用） |
+| `close` | `fn (self, loop, c, Userdata, userdata, cb) void` | 同步关闭 — 设置关闭标志，通知对端，同步回调。幂等（可安全多次调用） |
 | `isClosed` | `fn (self) bool` | 非阻塞检查关闭状态 |
 
 ---
@@ -1025,6 +1025,157 @@ pair.local.writeDirect(&loop, &wc2, 5, void, null, (struct {
 
 ---
 
+### fdconn.zig — FdStream 流适配器
+
+> **Phase 8** | std + libxev | 新建
+
+将 libxev fd 系流类型（TCP / File / GenericStream 等）适配为统一的 Stream 接口，
+消除 libxev 与 memconn/relay 之间的回调参数差异。
+
+**为什么独立成模块**：FdStream 被 relay、memconn 等多模块引用，放在 relay 中会造成循环依赖。
+
+#### 适配规则
+
+| 差异 | libxev 原生 | FdStream 适配后 |
+|------|------------|----------------|
+| 读缓冲区类型 | `xev.ReadBuffer` | `[]u8` |
+| 写缓冲区类型 | `xev.WriteBuffer` | `[]const u8` |
+| 读回调参数 | `(ud, l, c, s: S, rb, r)` | `(ud, l, c, buf: []u8, r)` |
+| 写回调参数 | `(ud, l, c, s: S, wb, r)` | `(ud, l, c, buf: []const u8, r)` |
+| 关闭回调参数 | `(ud, l, c, s: S, r)` | `(ud, l, c, void)` |
+| 错误传递 | 各类型独立 Error | 统一 error{Closed} / void |
+
+#### API
+
+| 函数 | 签名 | 描述 |
+|------|------|------|
+| `FdStream` | `fn (comptime S: type) type` | 泛型适配器工厂，返回实现 Stream 接口的结构体类型 |
+
+#### 使用示例
+
+```zig
+const fdconn = @import("fdconn");
+
+// 适配 libxev TCP
+const FdTCP = fdconn.FdStream(xev.TCP);
+var conn = FdTCP{ .inner = tcp_handle };
+
+// conn.read / conn.write / conn.close 现在满足 Stream 接口
+try relay.relay(allocator, &loop, conn, mem_stream, .{}, void, null, onDone);
+```
+
+---
+
+### relay.zig — 双向数据中继
+
+> **Phase 9** | std + libxev | 新建
+
+通用异步双向数据中继模块。在任意两个 Stream 端点之间建立双向数据对拷，
+通过 Completion 回调链实现零额外线程的异步 relay。
+
+#### 架构
+
+```
+relay(loop, A, B)
+  ├─ a_buf[8192]  — A→B 方向缓冲
+  ├─ b_buf[8192]  — B→A 方向缓冲
+  ├─ read A → write B → read A → ...  (Completion 链)
+  └─ read B → write A → read B → ...  (Completion 链)
+
+关闭序列:
+  端 A EOF → close(B) → close(A) → on_done 回调
+```
+
+#### Stream 概念
+
+任何实现以下 Completion 方法的类型都可作为 relay 端点：
+
+- `read(loop, c, buf: []u8, Userdata, userdata, cb)` — 异步读
+- `write(loop, c, buf: []const u8, Userdata, userdata, cb)` — 异步写
+- `close(loop, c, Userdata, userdata, cb)` — 异步关闭
+
+回调签名（与 memconn.MemStream 一致）：
+
+```
+read:  fn(ud, l, c, buf: []u8,       r: E!usize) CallbackAction  // 0=EOF
+write: fn(ud, l, c, buf: []const u8, r: E!usize) CallbackAction
+close: fn(ud, l, c,                  r: void)   CallbackAction
+```
+
+- **memconn.MemStream** 原生满足此接口，无需适配。
+- **libxev fd 系** (TCP/File/Stream) 通过 `fdconn.FdStream` 适配器包装。
+
+#### 类型
+
+```zig
+pub const RelayConfig = struct {
+    buf_size: usize = 8192,  // 每方向读缓冲区大小（字节）
+};
+```
+
+#### API
+
+| 函数 | 签名 | 描述 |
+|------|------|------|
+| `relay` | `fn (allocator, loop, a, b, config: RelayConfig, comptime Userdata, userdata, comptime on_done) !void` | 启动双向 relay，立即返回，在回调链中异步运行 |
+
+#### 使用示例
+
+##### 基本用法：memconn ↔ memconn relay
+
+```zig
+var loop = try xev.Loop.init(.{});
+defer loop.deinit();
+
+var pair_a = try memconn.createPair(4096, &loop, &loop, allocator);
+defer pair_a.destroy();
+var pair_b = try memconn.createPair(4096, &loop, &loop, allocator);
+defer pair_b.destroy();
+
+// 外部写入一端
+var wc: xev.Completion = .{};
+pair_a.local.write(&loop, &wc, "hello", void, null, writeCb);
+
+// 启动 relay
+var done = false;
+try relay.relay(allocator, &loop, pair_a.remote, pair_b.local, .{},
+    bool, &done, (struct {
+        fn cb(ud: ?*bool) void { ud.?.* = true; }
+    }).cb);
+
+// 另一端接收中继数据
+var read_buf: [64]u8 = undefined;
+var rc: xev.Completion = .{};
+pair_b.remote.read(&loop, &rc, &read_buf, ...);
+
+// 关闭触发 relay 完成
+pair_a.local.close(&loop, &cc, void, null, closeCb);
+try loop.run(.until_done);
+```
+
+##### libxev TCP 适配
+
+```zig
+// 将 libxev Stream 适配为中继端点（使用 fdconn.FdStream）
+const FdConn = foundation.fdconn.FdStream(xev.Stream);
+var conn_a = FdConn{ .inner = tcp_stream_a };
+var conn_b = FdConn{ .inner = tcp_stream_b };
+try foundation.relay.relay(allocator, &loop, conn_a, conn_b, .{}, void, null, onDone);
+```
+
+#### 注意事项
+
+1. **内存管理**：relay 内部通过 `allocator` 堆分配上下文和缓冲区。`finish()` 回调中不释放 RelayCtx 自身
+   （避免 close 回调链中的 use-after-free），调用者应使用 `ArenaAllocator` 管理 relay 生命周期。
+
+2. **Stream 所有权**：relay 启动后，a 和 b 的所有权转移给 relay 内部，不可从外部操作。
+
+3. **on_done 回调**：在 Loop 线程上下文中执行，两端都关闭后触发。
+
+4. **线程安全**：relay 在单个 Loop 内运行，两端 Completion 在同一事件循环调度。
+
+---
+
 ## 移动端开发环境搭建
 
 > 从裸机（macOS 开发主机）起步，构建可在 iOS 模拟器和 Android 模拟器上运行的 zigfoundation 示例程序并验证全部 13 个模块通过。
@@ -1299,6 +1450,8 @@ adb shell /data/local/tmp/zigfoundation-android-test
 
 | 版本 | 日期 | 变更 |
 |------|------|------|
+| 0.1.8 | 2026-07-20 | fdconn.zig 独立模块：将 FdStream 从 relay.zig 提取到 fdconn.zig，避免多模块引用时的循环依赖；239 tests 全绿 |
+| 0.1.7 | 2026-07-20 | Phase 9: relay.zig 异步双向数据中继模块（FdStream 适配器、RelayCtx Completion 链、4 tests）；memconn.close() 改为同步完成（修复与 pending read 在 self_read_async 上的 kqueue 冲突） |
 | 0.1.6 | 2026-07-20 | 零拷贝优化：RingBuf pushSlice/popSlice 用 `@memcpy` 批量拷贝（LLVM 自动向量化）；RingBuf 新增零拷贝 span API (writeSpan/commitWrite/readSpan/commitRead)；memconn 新增零拷贝 Completion (readDirect/writeDirect) 消除中间内存拷贝 |
 | 0.1.5 | 2026-07-20 | log.zig 平台日志增强：Android 改用 `__android_log_write`(logcat)、iOS 改用 `syslog`；build.zig 新增 `android-test` 步骤；Android liblog 通过 `addObjectFile` 链接 |
 | 0.1.4 | 2026-07-19 | memconn API 文档重写：6 种使用模式 + 回调签名速查 + 8 条注意事项（comptime 回调约束、Completion 生命周期、SPSC 契约、引用计数管理等） |
