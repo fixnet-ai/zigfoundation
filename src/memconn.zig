@@ -28,7 +28,7 @@
 //!   ├─ xev.Async ×4               — 每端点独立的读/写通知器
 //!   └─ atomic(bool)               — 关闭标志
 //!
-//! MemConn                         — 轻量句柄（指针语义，无所有权）
+//! MemStream                         — 轻量句柄（指针语义，无所有权）
 //!   ├─ read/write/close           — Completion 回调接口
 //!   └─ 可选 refcounted 清理       — createPair / Registry 用
 //! ```
@@ -38,7 +38,7 @@
 //! 1. **createPair — 单 Loop，堆分配 Completion**：
 //!    ```zig
 //!    const ConnCtx = struct {
-//!        conn: memconn.MemConn,
+//!        conn: memconn.MemStream,
 //!        read_c: xev.Completion,   // Completion 嵌入连接结构体（堆分配）
 //!        write_c: xev.Completion,
 //!        buf: [4096]u8,
@@ -74,7 +74,7 @@
 //! ## 线程安全
 //!
 //! - 每方向 SPSC（单生产者单消费者）：一个线程写，对端线程读
-//! - 同一 MemConn 不可从多线程并发 read/write
+//! - 同一 MemStream 不可从多线程并发 read/write
 //! - close() 可从任意线程安全调用
 //! - Registry 由 Mutex 保护，线程安全
 //! - 不同操作必须使用不同的 Completion（read/write/close 各用各的）
@@ -92,7 +92,7 @@ const RingBuf = ring_mod.RingBuf;
 // 错误集
 // ============================================================================
 
-pub const MemConnError = error{
+pub const MemStreamError = error{
     Closed,
     NameNotFound,
     NameInUse,
@@ -166,10 +166,10 @@ fn SharedState(comptime buf_size: usize) type {
 }
 
 // ============================================================================
-// MemConn — 异步 Completion 句柄
+// MemStream — 异步 Completion 句柄
 // ============================================================================
 
-pub const MemConn = struct {
+pub const MemStream = struct {
     tx_ring: *RingBuf(u8),
     rx_ring: *RingBuf(u8),
     self_read_async: *xev.Async,
@@ -191,7 +191,7 @@ pub const MemConn = struct {
     ///
     /// cb: fn (?*Userdata, *xev.Loop, *xev.Completion, []u8, error{Closed}!usize) xev.CallbackAction
     pub fn read(
-        self: *const MemConn,
+        self: *const MemStream,
         loop: *xev.Loop,
         c: *xev.Completion,
         buf: []u8,
@@ -233,7 +233,7 @@ pub const MemConn = struct {
     ///
     /// cb: fn (?*Userdata, *xev.Loop, *xev.Completion, []const u8, error{Closed}!usize) xev.CallbackAction
     pub fn write(
-        self: *const MemConn,
+        self: *const MemStream,
         loop: *xev.Loop,
         c: *xev.Completion,
         buf: []const u8,
@@ -304,7 +304,7 @@ pub const MemConn = struct {
     /// 设置关闭标志，通知对端。完成时回调 cb。
     /// cb: fn (?*Userdata, *xev.Loop, *xev.Completion, void) xev.CallbackAction
     pub fn close(
-        self: *const MemConn,
+        self: *const MemStream,
         loop: *xev.Loop,
         c: *xev.Completion,
         comptime Userdata: type,
@@ -317,7 +317,7 @@ pub const MemConn = struct {
         ) xev.CallbackAction,
     ) void {
         // 幂等关闭：若已关闭则同步完成，避免在同一 Async 上注册多个 Completion。
-        // Registry 模式下，不同 MemConn 共享同一 closed 标志，因此后关闭的
+        // Registry 模式下，不同 MemStream 共享同一 closed 标志，因此后关闭的
         // 连接在此处释放其引用计数（先关闭的连接在 CloseOp.internalCb 中释放）。
         if (self.closed.load(.acquire)) {
             _ = cb(userdata, loop, c, {});
@@ -352,7 +352,7 @@ pub const MemConn = struct {
         self.self_read_async.wait(loop, c, S, op, S.internalCb);
     }
 
-    pub fn isClosed(self: *const MemConn) bool {
+    pub fn isClosed(self: *const MemStream) bool {
         return self.closed.load(.acquire);
     }
 
@@ -369,7 +369,7 @@ pub const MemConn = struct {
     ///
     /// cb: fn (?*Userdata, *xev.Loop, *xev.Completion, []const u8, error{Closed}!usize) xev.CallbackAction
     pub fn readDirect(
-        self: *const MemConn,
+        self: *const MemStream,
         loop: *xev.Loop,
         c: *xev.Completion,
         comptime Userdata: type,
@@ -410,7 +410,7 @@ pub const MemConn = struct {
     ///
     /// cb: fn (?*Userdata, *xev.Loop, *xev.Completion, []u8, error{Closed}!usize) xev.CallbackAction
     pub fn writeDirect(
-        self: *const MemConn,
+        self: *const MemStream,
         loop: *xev.Loop,
         c: *xev.Completion,
         n: usize,
@@ -459,7 +459,7 @@ fn ReadOp(comptime Userdata: type, comptime cb: anytype) type {
         const Self = @This();
 
         allocator: std.mem.Allocator,
-        memconn: MemConn,
+        memconn: MemStream,
         buf: []u8,
         userdata: ?*Userdata,
 
@@ -498,7 +498,7 @@ fn WriteOp(comptime Userdata: type, comptime cb: anytype) type {
         const Self = @This();
 
         allocator: std.mem.Allocator,
-        memconn: MemConn,
+        memconn: MemStream,
         buf: []const u8,
         written: usize,
         userdata: ?*Userdata,
@@ -544,7 +544,7 @@ fn CloseOp(comptime Userdata: type, comptime cb: anytype) type {
         const Self = @This();
 
         allocator: std.mem.Allocator,
-        memconn: MemConn,
+        memconn: MemStream,
         userdata: ?*Userdata,
 
         fn internalCb(
@@ -585,7 +585,7 @@ fn ReadDirectOp(comptime Userdata: type, comptime cb: anytype) type {
         const Self = @This();
 
         allocator: std.mem.Allocator,
-        memconn: MemConn,
+        memconn: MemStream,
         userdata: ?*Userdata,
 
         fn internalCb(
@@ -622,7 +622,7 @@ fn WriteDirectOp(comptime Userdata: type, comptime cb: anytype) type {
         const Self = @This();
 
         allocator: std.mem.Allocator,
-        memconn: MemConn,
+        memconn: MemStream,
         n: usize,
         userdata: ?*Userdata,
 
@@ -662,8 +662,8 @@ fn WriteDirectOp(comptime Userdata: type, comptime cb: anytype) type {
 // ============================================================================
 
 pub const PairHandle = struct {
-    local: MemConn,
-    remote: MemConn,
+    local: MemStream,
+    remote: MemStream,
 
     /// 释放共享状态（同步，调用前确保无 pending completions）。
     ///
@@ -696,7 +696,7 @@ pub fn createPair(
     const S = SharedState(buf_size);
     const shared = try S.init(allocator);
 
-    const local = MemConn{
+    const local = MemStream{
         .tx_ring = &shared.a_to_b_ring,
         .rx_ring = &shared.b_to_a_ring,
         .self_read_async = &shared.a_read_async,
@@ -709,7 +709,7 @@ pub fn createPair(
         .allocator = allocator,
     };
 
-    const remote = MemConn{
+    const remote = MemStream{
         .tx_ring = &shared.b_to_a_ring,
         .rx_ring = &shared.a_to_b_ring,
         .self_read_async = &shared.b_read_async,
@@ -771,7 +771,7 @@ pub const MemListener = struct {
     _allocator: std.mem.Allocator,
     _queue_mutex: Mutex = .{},
     _notify: xev.Async,
-    _queue_buf: [16]MemConn = undefined,
+    _queue_buf: [16]MemStream = undefined,
     _queue_head: usize = 0,
     _queue_tail: usize = 0,
     _queue_count: usize = 0,
@@ -800,7 +800,7 @@ pub const MemListener = struct {
     }
 
     /// 推入新连接到 accept 队列。满时覆盖最旧连接（关闭旧连接触发清理）。
-    fn pushConn(self: *MemListener, conn: MemConn) void {
+    fn pushConn(self: *MemListener, conn: MemStream) void {
         self._queue_mutex.lock();
         defer self._queue_mutex.unlock();
 
@@ -820,7 +820,7 @@ pub const MemListener = struct {
     }
 
     /// 取出一个连接。空时返回 null。
-    fn popConn(self: *MemListener) ?MemConn {
+    fn popConn(self: *MemListener) ?MemStream {
         self._queue_mutex.lock();
         defer self._queue_mutex.unlock();
 
@@ -844,7 +844,7 @@ pub const MemListener = struct {
 
     /// 注册异步接受操作。
     ///
-    /// cb: fn (?*Userdata, *xev.Loop, *xev.Completion, ?MemConn) xev.CallbackAction
+    /// cb: fn (?*Userdata, *xev.Loop, *xev.Completion, ?MemStream) xev.CallbackAction
     /// 返回 null 且 listener 已关闭表示 listener 已终止。
     pub fn accept(
         self: *MemListener,
@@ -856,7 +856,7 @@ pub const MemListener = struct {
             ud: ?*Userdata,
             l: *xev.Loop,
             c_inner: *xev.Completion,
-            conn: ?MemConn,
+            conn: ?MemStream,
         ) xev.CallbackAction,
     ) void {
         const S = AcceptOp(Userdata, cb);
@@ -973,7 +973,7 @@ pub const Registry = struct {
         return listener;
     }
 
-    pub fn dial(self: *Registry, comptime buf_size: usize, name: []const u8) !MemConn {
+    pub fn dial(self: *Registry, comptime buf_size: usize, name: []const u8) !MemStream {
         self._mutex.lock();
         defer self._mutex.unlock();
 
@@ -984,7 +984,7 @@ pub const Registry = struct {
 
         // local → 返回给 dial 调用者
         // remote → 推入 accept 队列
-        const local = MemConn{
+        const local = MemStream{
             .tx_ring = &shared.a_to_b_ring,
             .rx_ring = &shared.b_to_a_ring,
             .self_read_async = &shared.a_read_async,
@@ -997,7 +997,7 @@ pub const Registry = struct {
             ._close_releases = true,
             .allocator = self._allocator,
         };
-        const remote = MemConn{
+        const remote = MemStream{
             .tx_ring = &shared.b_to_a_ring,
             .rx_ring = &shared.a_to_b_ring,
             .self_read_async = &shared.b_read_async,
@@ -1072,7 +1072,7 @@ pub fn listen(name: []const u8) !*MemListener {
     return reg.listen(name_copy);
 }
 
-pub fn dial(comptime buf_size: usize, name: []const u8) !MemConn {
+pub fn dial(comptime buf_size: usize, name: []const u8) !MemStream {
     global_mutex.lock();
     const reg = global_registry orelse {
         global_mutex.unlock();
@@ -1437,7 +1437,7 @@ test "createPair: zero-length write" {
 test "createPair: cross-thread write/read" {
     const Ctx = struct {
         loop: *xev.Loop,
-        remote: *MemConn,
+        remote: *MemStream,
         done: std.atomic.Value(bool) = .init(false),
         read_buf: [64]u8 = undefined,
         read_n: usize = 0,
@@ -1489,7 +1489,7 @@ test "createPair: cross-thread write/read" {
 test "createPair: cross-thread close wakes reader" {
     const Ctx = struct {
         loop: *xev.Loop,
-        remote: *MemConn,
+        remote: *MemStream,
         done: std.atomic.Value(bool) = .init(false),
         read_n: isize = -1,
     };
@@ -1565,10 +1565,10 @@ test "Registry: listen then dial and accept" {
     }).cb);
 
     // accept
-    var accepted_conn: ?MemConn = null;
+    var accepted_conn: ?MemStream = null;
     var ac: xev.Completion = .{};
-    listener.accept(&loop, &ac, ?MemConn, &accepted_conn, (struct {
-        fn cb(ud: ?*?MemConn, l: *xev.Loop, c: *xev.Completion, c2: ?MemConn) xev.CallbackAction {
+    listener.accept(&loop, &ac, ?MemStream, &accepted_conn, (struct {
+        fn cb(ud: ?*?MemStream, l: *xev.Loop, c: *xev.Completion, c2: ?MemStream) xev.CallbackAction {
             _ = l;
             _ = c;
             ud.?.* = c2;
@@ -1654,10 +1654,10 @@ test "Registry: listener close wakes accept with null" {
 
     var listener = try reg.listen("close_test");
 
-    var accepted: ?MemConn = null;
+    var accepted: ?MemStream = null;
     var ac: xev.Completion = .{};
-    listener.accept(&loop, &ac, ?MemConn, &accepted, (struct {
-        fn cb(ud: ?*?MemConn, l: *xev.Loop, c: *xev.Completion, c2: ?MemConn) xev.CallbackAction {
+    listener.accept(&loop, &ac, ?MemStream, &accepted, (struct {
+        fn cb(ud: ?*?MemStream, l: *xev.Loop, c: *xev.Completion, c2: ?MemStream) xev.CallbackAction {
             _ = l;
             _ = c;
             ud.?.* = c2;
@@ -1669,7 +1669,7 @@ test "Registry: listener close wakes accept with null" {
     listener.close();
 
     try loop.run(.until_done);
-    try testing.expectEqual(@as(?MemConn, null), accepted);
+    try testing.expectEqual(@as(?MemStream, null), accepted);
 }
 
 test "Registry: multiple listeners" {
@@ -1711,13 +1711,13 @@ test "Registry: multiple listeners" {
         }
     }).cb);
 
-    var acc_a: ?MemConn = null;
-    var acc_b: ?MemConn = null;
+    var acc_a: ?MemStream = null;
+    var acc_b: ?MemStream = null;
     var ac_a: xev.Completion = .{};
     var ac_b: xev.Completion = .{};
 
-    l1.accept(&loop, &ac_a, ?MemConn, &acc_a, (struct {
-        fn cb(ud: ?*?MemConn, l: *xev.Loop, c: *xev.Completion, conn: ?MemConn) xev.CallbackAction {
+    l1.accept(&loop, &ac_a, ?MemStream, &acc_a, (struct {
+        fn cb(ud: ?*?MemStream, l: *xev.Loop, c: *xev.Completion, conn: ?MemStream) xev.CallbackAction {
             _ = l;
             _ = c;
             ud.?.* = conn;
@@ -1725,8 +1725,8 @@ test "Registry: multiple listeners" {
         }
     }).cb);
 
-    l2.accept(&loop, &ac_b, ?MemConn, &acc_b, (struct {
-        fn cb(ud: ?*?MemConn, l: *xev.Loop, c: *xev.Completion, conn: ?MemConn) xev.CallbackAction {
+    l2.accept(&loop, &ac_b, ?MemStream, &acc_b, (struct {
+        fn cb(ud: ?*?MemStream, l: *xev.Loop, c: *xev.Completion, conn: ?MemStream) xev.CallbackAction {
             _ = l;
             _ = c;
             ud.?.* = conn;
@@ -1830,10 +1830,10 @@ test "global registry: listen/dial round-trip" {
     }).cb);
 
     // accept
-    var accepted: ?MemConn = null;
+    var accepted: ?MemStream = null;
     var ac: xev.Completion = .{};
-    listener.accept(&loop, &ac, ?MemConn, &accepted, (struct {
-        fn cb(ud: ?*?MemConn, l: *xev.Loop, c: *xev.Completion, c2: ?MemConn) xev.CallbackAction {
+    listener.accept(&loop, &ac, ?MemStream, &accepted, (struct {
+        fn cb(ud: ?*?MemStream, l: *xev.Loop, c: *xev.Completion, c2: ?MemStream) xev.CallbackAction {
             _ = l;
             _ = c;
             ud.?.* = c2;
@@ -1939,7 +1939,7 @@ test "Registry: cross-thread dial and accept" {
     const Ctx = struct {
         loop: *xev.Loop,
         listener: *MemListener,
-        conn: ?MemConn = null,
+        conn: ?MemStream = null,
         done: std.atomic.Value(bool) = .init(false),
         buf: [64]u8 = undefined,
         n: usize = 0,
@@ -1950,8 +1950,8 @@ test "Registry: cross-thread dial and accept" {
     const t = try std.Thread.spawn(.{}, (struct {
         fn run(c: *Ctx) void {
             var ac: xev.Completion = .{};
-            c.listener.accept(c.loop, &ac, ?MemConn, &c.conn, (struct {
-                fn cb(ud: ?*?MemConn, l: *xev.Loop, ci: *xev.Completion, c2: ?MemConn) xev.CallbackAction {
+            c.listener.accept(c.loop, &ac, ?MemStream, &c.conn, (struct {
+                fn cb(ud: ?*?MemStream, l: *xev.Loop, ci: *xev.Completion, c2: ?MemStream) xev.CallbackAction {
                     _ = l;
                     _ = ci;
                     ud.?.* = c2;
