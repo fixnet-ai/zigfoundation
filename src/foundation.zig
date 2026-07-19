@@ -33,6 +33,7 @@ pub const net = @import("net.zig");
 pub const strings = @import("strings.zig");
 pub const cli = @import("cli.zig");
 pub const log = @import("log.zig");
+pub const signal = @import("signal.zig");
 
 // ---- Phase 4: 存储、配置与并发 (std + libyaml) ----
 pub const yaml = @import("yaml.zig");
@@ -60,6 +61,7 @@ test {
     _ = @import("strings.zig");
     _ = @import("cli.zig");
     _ = @import("log.zig");
+    _ = @import("signal.zig");
     _ = @import("yaml.zig");
     _ = @import("store.zig");
     _ = @import("event.zig");
