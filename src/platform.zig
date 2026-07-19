@@ -34,7 +34,8 @@ pub const isMobile = switch (native_os) {
 // ============================================================
 
 /// 单调时钟毫秒时间戳。跨平台，不受系统时间调整影响。
-/// Windows: GetTickCount64; POSIX: clock_gettime(CLOCK_MONOTONIC)。
+/// Windows: GetTickCount64; POSIX: clock_gettime（macOS/non-Linux: CLOCK_MONOTONIC;
+/// Linux: CLOCK_BOOTTIME，含 suspend 时间，对齐 zigtun NAT 超时语义）。
 pub fn monoMillis() i64 {
     if (native_os == .windows) {
         const Win32 = struct {
@@ -43,7 +44,12 @@ pub fn monoMillis() i64 {
         return @as(i64, @intCast(Win32.GetTickCount64()));
     }
     var ts: c.timespec = undefined;
-    _ = c.clock_gettime(c.CLOCK.MONOTONIC, &ts);
+    // Linux 使用 CLOCK_BOOTTIME（含 suspend 时间），对齐 zigtun NAT 超时语义
+    const clock_id = if (native_os == .linux)
+        @as(c.CLOCK, @enumFromInt(7)) // CLOCK_BOOTTIME
+    else
+        c.CLOCK.MONOTONIC;
+    _ = c.clock_gettime(clock_id, &ts);
     return @as(i64, ts.sec) * std.time.ms_per_s + @divFloor(@as(i64, ts.nsec), std.time.ns_per_ms);
 }
 
