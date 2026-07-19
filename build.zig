@@ -36,6 +36,16 @@ pub fn build(b: *std.Build) void {
     lib_module.addImport("yaml_c", yaml_dep.module("yaml_c"));
     lib_module.addImport("xev", libxev_dep.module("xev"));
 
+    // 注册模块供外部依赖通过 dep.module("zigfoundation") 访问
+    const pub_module = b.addModule("zigfoundation", .{
+        .root_source_file = b.path("src/foundation.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    pub_module.addImport("zli", zli_module);
+    pub_module.addImport("yaml_c", yaml_dep.module("yaml_c"));
+    pub_module.addImport("xev", libxev_dep.module("xev"));
+
     // ---- 目标: 静态库 ----
     const lib = b.addLibrary(.{
         .name = "zigfoundation",
