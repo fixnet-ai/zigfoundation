@@ -449,6 +449,316 @@ pub const Cidr6 = struct {
 };
 
 // ============================================================
+// 统一 IP 地址类型
+// ============================================================
+
+/// 统一 IP 地址 — 同时支持 IPv4 和 IPv6
+pub const IpAddr = union(enum) {
+    v4: Ip4Addr,
+    v6: Ip6Addr,
+
+    pub const unspecified: IpAddr = .{ .v4 = .{0} ** 4 };
+
+    /// 格式化 IP 地址为人类可读字符串
+    pub fn format(self: IpAddr, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        switch (self) {
+            .v4 => |a| try writer.print("{d}.{d}.{d}.{d}", .{ a[0], a[1], a[2], a[3] }),
+            .v6 => |a| {
+                try writer.print("{x}:{x}:{x}:{x}:{x}:{x}:{x}:{x}", .{
+                    endian.readU16Big(a[0..2]),
+                    endian.readU16Big(a[2..4]),
+                    endian.readU16Big(a[4..6]),
+                    endian.readU16Big(a[6..8]),
+                    endian.readU16Big(a[8..10]),
+                    endian.readU16Big(a[10..12]),
+                    endian.readU16Big(a[12..14]),
+                    endian.readU16Big(a[14..16]),
+                });
+            },
+        }
+    }
+
+    /// 检查是否为非零地址
+    pub fn isValid(self: IpAddr) bool {
+        return switch (self) {
+            .v4 => |a| !std.mem.allEqual(u8, &a, 0),
+            .v6 => |a| !std.mem.allEqual(u8, &a, 0),
+        };
+    }
+
+    /// 返回此地址的下一个地址（用于遍历 IP 范围）
+    pub fn next(self: IpAddr) IpAddr {
+        switch (self) {
+            .v4 => |a| {
+                var v = endian.readU32Big(&a);
+                v += 1;
+                var out: Ip4Addr = undefined;
+                endian.writeU32Big(&out, v);
+                return .{ .v4 = out };
+            },
+            .v6 => |a| {
+                var out: Ip6Addr = a;
+                var i: usize = 15;
+                while (i >= 0) : (i -= 1) {
+                    out[i] +%= 1;
+                    if (out[i] != 0) break;
+                }
+                return .{ .v6 = out };
+            },
+        }
+    }
+
+    pub fn ipv4Unspecified() IpAddr {
+        return .{ .v4 = .{0} ** 4 };
+    }
+
+    pub fn ipv6Unspecified() IpAddr {
+        return .{ .v6 = .{0} ** 16 };
+    }
+};
+
+// ============================================================
+// IP 前缀（CIDR 地址块）
+// ============================================================
+
+/// IP 前缀 — 网络地址 + 前缀长度
+pub const IpPrefix = struct {
+    addr: IpAddr,
+    bits: u8,
+
+    /// 检查 IP 是否在此前缀范围内
+    pub fn contains(self: IpPrefix, a: IpAddr) bool {
+        return switch (self.addr) {
+            .v4 => |net| switch (a) {
+                .v4 => |host| blk: {
+                    if (self.bits > 32) return false;
+                    if (self.bits == 0) return true;
+                    const mask: u32 = @as(u32, 0xFFFF_FFFF) << @intCast(32 - self.bits);
+                    const net_u32 = endian.readU32Big(&net);
+                    const host_u32 = endian.readU32Big(&host);
+                    break :blk (net_u32 & mask) == (host_u32 & mask);
+                },
+                .v6 => false,
+            },
+            .v6 => |net| switch (a) {
+                .v4 => false,
+                .v6 => |host| blk: {
+                    if (self.bits > 128) return false;
+                    if (self.bits == 0) return true;
+                    const full_bytes = self.bits / 8;
+                    if (full_bytes > 0) {
+                        if (!std.mem.eql(u8, net[0..full_bytes], host[0..full_bytes])) return false;
+                    }
+                    const rem_bits = self.bits % 8;
+                    if (rem_bits > 0) {
+                        const mask: u8 = @as(u8, 0xFF) << @intCast(8 - rem_bits);
+                        if ((net[full_bytes] & mask) != (host[full_bytes] & mask)) return false;
+                    }
+                    break :blk true;
+                },
+            },
+        };
+    }
+
+    /// 返回网络地址（主机位清零）
+    pub fn masked(self: IpPrefix) IpAddr {
+        return switch (self.addr) {
+            .v4 => |a| {
+                if (self.bits >= 32) return self.addr;
+                const mask: u32 = @as(u32, 0xFFFF_FFFF) << @intCast(32 - self.bits);
+                const net_u32 = endian.readU32Big(&a) & mask;
+                var out: Ip4Addr = undefined;
+                endian.writeU32Big(&out, net_u32);
+                return .{ .v4 = out };
+            },
+            .v6 => |a| {
+                var out: Ip6Addr = a;
+                const full_bytes = self.bits / 8;
+                @memset(out[full_bytes..], 0);
+                const rem_bits = self.bits % 8;
+                if (rem_bits > 0) {
+                    const mask: u8 = @as(u8, 0xFF) << @intCast(8 - rem_bits);
+                    out[full_bytes] &= mask;
+                }
+                return .{ .v6 = out };
+            },
+        };
+    }
+};
+
+// ============================================================
+// SOCKS 地址
+// ============================================================
+
+/// SOCKS 地址 — IP + 端口
+pub const SocksAddr = struct {
+    addr: IpAddr = IpAddr.unspecified,
+    port: u16 = 0,
+
+    pub fn init(addr: IpAddr, port: u16) SocksAddr {
+        return .{ .addr = addr, .port = port };
+    }
+
+    pub fn format(self: SocksAddr, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        switch (self.addr) {
+            .v4 => |a| try writer.print("{d}.{d}.{d}.{d}:{d}", .{ a[0], a[1], a[2], a[3], self.port }),
+            .v6 => |a| {
+                try writer.print("[{x}:{x}:{x}:{x}:{x}:{x}:{x}:{x}]:{d}", .{
+                    endian.readU16Big(a[0..2]),
+                    endian.readU16Big(a[2..4]),
+                    endian.readU16Big(a[4..6]),
+                    endian.readU16Big(a[6..8]),
+                    endian.readU16Big(a[8..10]),
+                    endian.readU16Big(a[10..12]),
+                    endian.readU16Big(a[12..14]),
+                    endian.readU16Big(a[14..16]),
+                    self.port,
+                });
+            },
+        }
+    }
+};
+
+// ============================================================
+// 32 位无符号整数范围
+// ============================================================
+
+/// 32 位整数范围 — 用于端口范围等
+pub const Uint32Range = struct {
+    start: u32,
+    end: u32,
+
+    /// 用于排序的比较函数
+    pub fn lessThan(_: void, a: @This(), b: @This()) bool {
+        return a.start < b.start;
+    }
+};
+
+// ============================================================
+// 统一 CIDR（用于路由规则匹配）
+// ============================================================
+
+/// 统一 CIDR 类型 — 同时容纳 IPv4 和 IPv6，用于规则匹配
+/// Cidr4/Cidr6 保留用于网络地址运算（broadcastAddr/netmask 等）
+pub const Cidr = union(enum) {
+    v4: Cidr4,
+    v6: Cidr6,
+
+    /// 自动检测 v4/v6 并解析 CIDR 字符串
+    pub fn parse(s: []const u8) !Cidr {
+        // 先尝试 IPv4
+        if (Cidr4.parse(s)) |c4| return .{ .v4 = c4 } else |_| {}
+        // 再尝试 IPv6
+        if (Cidr6.parse(s)) |c6| return .{ .v6 = c6 } else |_| {}
+        return error.InvalidCidr;
+    }
+
+    /// 检查 IpAddr 是否在此 CIDR 范围内
+    pub fn contains(self: Cidr, ip: IpAddr) bool {
+        return switch (self) {
+            .v4 => |c4| switch (ip) {
+                .v4 => |a4| c4.containsIp4(a4),
+                .v6 => false,
+            },
+            .v6 => |c6| switch (ip) {
+                .v4 => false,
+                .v6 => |a6| c6.contains(a6),
+            },
+        };
+    }
+
+    /// 检查 Ipv4 字节地址
+    pub fn containsIp4(self: Cidr, ip: Ip4Addr) bool {
+        return switch (self) {
+            .v4 => |c4| c4.containsIp4(ip),
+            .v6 => false,
+        };
+    }
+
+    /// 检查 Ipv6 字节地址
+    pub fn containsIp6(self: Cidr, ip: Ip6Addr) bool {
+        return switch (self) {
+            .v4 => false,
+            .v6 => |c6| c6.contains(ip),
+        };
+    }
+
+    /// 前缀长度
+    pub fn prefixLen(self: Cidr) u8 {
+        return switch (self) {
+            .v4 => |c4| c4.prefixLen(),
+            .v6 => |c6| c6.prefixLen(),
+        };
+    }
+
+    /// 格式化 CIDR 为字符串
+    pub fn format(self: Cidr, buf: *[max_addr_buf]u8) ![]const u8 {
+        return switch (self) {
+            .v4 => |c4| c4.format(buf),
+            .v6 => |c6| c6.format(buf),
+        };
+    }
+};
+
+// ============================================================
+// 端口范围
+// ============================================================
+
+/// 端口范围 — 支持 "1000:2000" / ":80" / "1000:" 格式
+pub const PortRange = struct {
+    start: u16,
+    end: u16,
+
+    /// 解析端口范围字符串。格式: "start:end" / ":end" (0..end) / "start:" (start..65535)
+    pub fn parse(s: []const u8) !PortRange {
+        const idx = std.mem.indexOfScalar(u8, s, ':') orelse return error.InvalidPortRange;
+        const start: u16 = if (idx == 0)
+            0
+        else
+            std.fmt.parseInt(u16, s[0..idx], 10) catch return error.InvalidPortRange;
+        const end: u16 = if (idx == s.len - 1)
+            0xffff
+        else
+            std.fmt.parseInt(u16, s[idx + 1 ..], 10) catch return error.InvalidPortRange;
+        return .{ .start = start, .end = end };
+    }
+
+    /// 检查端口是否在此范围内
+    pub fn contains(self: PortRange, port: u16) bool {
+        return port >= self.start and port <= self.end;
+    }
+};
+
+// ============================================================
+// 非公网地址判定
+// ============================================================
+
+/// 非公网 IPv4 地址判定 — 对齐 sing-box IsPublicAddr 取反
+/// private || loopback || multicast || link-local || unspecified
+pub fn isNonPublicV4(a: Ip4Addr) bool {
+    if (a[0] == 0 and a[1] == 0 and a[2] == 0 and a[3] == 0) return true; // unspecified
+    if (a[0] == 10) return true; // 10.0.0.0/8
+    if (a[0] == 172 and (a[1] & 0xf0) == 16) return true; // 172.16.0.0/12
+    if (a[0] == 192 and a[1] == 168) return true; // 192.168.0.0/16
+    if (a[0] == 127) return true; // loopback
+    if (a[0] == 169 and a[1] == 254) return true; // link-local
+    if (a[0] >= 224 and a[0] <= 239) return true; // multicast
+    return false;
+}
+
+/// 非公网 IPv6 地址判定
+pub fn isNonPublicV6(a: Ip6Addr) bool {
+    if (std.mem.allEqual(u8, a[0..15], 0)) {
+        if (a[15] == 0) return true; // :: unspecified
+        if (a[15] == 1) return true; // ::1 loopback
+    }
+    if ((a[0] & 0xfe) == 0xfc) return true; // fc00::/7 unique local (private)
+    if (a[0] == 0xfe and (a[1] & 0xc0) == 0x80) return true; // fe80::/10 link-local
+    if (a[0] == 0xff) return true; // ff00::/8 multicast
+    return false;
+}
+
+// ============================================================
 // Host/Port 解析
 // ============================================================
 
@@ -933,4 +1243,74 @@ test "buildHostPort: domain with port" {
     var buf: [max_host_port_len]u8 = undefined;
     const s = try buildHostPort("test.example.com", 8080, &buf);
     try testing.expectEqualStrings("test.example.com:8080", s);
+}
+
+test "net: IpAddr format v4" {
+    const addr = IpAddr{ .v4 = .{ 192, 168, 1, 1 } };
+    var buf: [64]u8 = undefined;
+    const s = try std.fmt.bufPrint(&buf, "{f}", .{addr});
+    try testing.expectEqualStrings("192.168.1.1", s);
+}
+
+test "net: IpAddr isValid detects zero" {
+    const zero = IpAddr{ .v4 = .{0} ** 4 };
+    try testing.expect(!zero.isValid());
+    const one = IpAddr{ .v4 = .{ 1, 1, 1, 1 } };
+    try testing.expect(one.isValid());
+}
+
+test "net: IpPrefix contains v4" {
+    const pfx = IpPrefix{ .addr = .{ .v4 = .{ 192, 168, 1, 0 } }, .bits = 24 };
+    try testing.expect(pfx.contains(.{ .v4 = .{ 192, 168, 1, 100 } }));
+    try testing.expect(!pfx.contains(.{ .v4 = .{ 192, 168, 2, 1 } }));
+}
+
+test "net: IpPrefix contains v6" {
+    const pfx = IpPrefix{ .addr = .{ .v6 = .{ 0x20, 0x01, 0x0d, 0xb8, 0,0,0,0,0,0,0,0,0,0,0,0 } }, .bits = 32 };
+    try testing.expect(pfx.contains(.{ .v6 = .{ 0x20, 0x01, 0x0d, 0xb8, 0,0,0,1,0,0,0,0,0,0,0,0 } }));
+    try testing.expect(!pfx.contains(.{ .v6 = .{ 0x20, 0x01, 0x0d, 0xb9, 0,0,0,0,0,0,0,0,0,0,0,0 } }));
+}
+
+test "net: Cidr parse v4 and v6" {
+    const c4 = try Cidr.parse("10.0.0.0/8");
+    try testing.expect(c4 == .v4);
+    try testing.expect(c4.containsIp4(.{ 10, 1, 2, 3 }));
+    try testing.expect(!c4.containsIp4(.{ 192, 168, 1, 1 }));
+
+    const c6 = try Cidr.parse("2001:db8::/32");
+    try testing.expect(c6 == .v6);
+    try testing.expect(c6.containsIp6(.{ 0x20, 0x01, 0x0d, 0xb8, 0,0,0,1,0,0,0,0,0,0,0,0 }));
+}
+
+test "net: PortRange parse and contains" {
+    const r = try PortRange.parse("1000:2000");
+    try testing.expect(r.contains(1000));
+    try testing.expect(r.contains(1500));
+    try testing.expect(r.contains(2000));
+    try testing.expect(!r.contains(999));
+    try testing.expect(!r.contains(2001));
+
+    const r2 = try PortRange.parse(":80");
+    try testing.expect(r2.contains(0));
+    try testing.expect(r2.contains(80));
+    try testing.expect(!r2.contains(81));
+
+    const r3 = try PortRange.parse("1000:");
+    try testing.expect(r3.contains(1000));
+    try testing.expect(r3.contains(65535));
+    try testing.expect(!r3.contains(999));
+}
+
+test "net: isNonPublicV4" {
+    try testing.expect(isNonPublicV4(.{ 10, 1, 2, 3 }));
+    try testing.expect(isNonPublicV4(.{ 192, 168, 1, 1 }));
+    try testing.expect(isNonPublicV4(.{ 127, 0, 0, 1 }));
+    try testing.expect(isNonPublicV4(.{ 0, 0, 0, 0 }));
+    try testing.expect(!isNonPublicV4(.{ 8, 8, 8, 8 }));
+}
+
+test "net: isNonPublicV6" {
+    try testing.expect(isNonPublicV6(.{ 0xfc, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,1 }));
+    try testing.expect(isNonPublicV6(.{ 0xfe, 0x80, 0,0,0,0,0,0,0,0,0,0,0,0,0,1 }));
+    try testing.expect(isNonPublicV6(.{0} ** 16));
 }
