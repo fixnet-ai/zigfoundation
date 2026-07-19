@@ -499,9 +499,11 @@ pub const IpAddr = union(enum) {
             .v6 => |a| {
                 var out: Ip6Addr = a;
                 var i: usize = 15;
-                while (i >= 0) : (i -= 1) {
+                while (true) {
                     out[i] +%= 1;
                     if (out[i] != 0) break;
+                    if (i == 0) break;
+                    i -= 1;
                 }
                 return .{ .v6 = out };
             },
