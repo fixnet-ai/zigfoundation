@@ -193,6 +193,10 @@ pub const BufferPool = struct {
 
 const testing = std.testing;
 
+test "buffer: reference all pub decls (lazy-analysis guard)" {
+    testing.refAllDecls(@This());
+}
+
 test "buffer: init/deinit" {
     var pool = try BufferPool.init(testing.allocator, .{ .block_size = 4096, .initial_blocks = 4, .max_blocks = 16 });
     defer pool.deinit();

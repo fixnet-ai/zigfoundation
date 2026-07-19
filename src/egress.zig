@@ -4,8 +4,8 @@
 //! - TCP/UDP socket 创建
 //! - 接口绑定（绕过路由表）：
 //!   - Linux: `SO_BINDTODEVICE`（按接口名绑定）
-//!   - macOS/iOS: `IP_BOUND_IF`（按接口索引绑定）
-//!   - Windows: `IP_UNICAST_IF`（按接口索引绑定）
+//!   - macOS/iOS: `IP_BOUND_IF` / `IPV6_BOUND_IF`（按接口索引绑定）
+//!   - Windows: `IP_UNICAST_IF` / `IPV6_UNICAST_IF`（按接口索引绑定）
 //! - 源地址绑定（`bind()` before `connect()`）
 //! - SO_REUSEADDR 设置
 //!
@@ -34,24 +34,40 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 /// 跨平台 socket 协议常量（避免 std.posix.AF/SOCK/IPPROTO 在不同 OS 上的类型差异）。
-const AF_INET: u32 = 2;
-const AF_INET6: u32 = 30;
+/// 注意：这些值因平台而异，必须按 builtin.os.tag 分派，不能写死单一平台的值。
+const AF_INET: u32 = 2; // 全平台一致
+const AF_INET6: u32 = switch (builtin.os.tag) {
+    .linux => 10, // Linux/Android (bionic 同 kernel)
+    .windows => 23,
+    else => 30, // Darwin (macOS/iOS/tvOS/watchOS)
+};
 const SOCK_STREAM: u32 = 1;
 const SOCK_DGRAM: u32 = 2;
 const IPPROTO_TCP: u32 = 6;
 const IPPROTO_UDP: u32 = 17;
 
-/// 协议级别常量（全平台通用）。
-const SOL_SOCKET: i32 = 0xffff; // SOL_SOCKET (fits in i32)
-const IPPROTO_IP: i32 = 0; // IPPROTO_IP
-const IPPROTO_IPV6: i32 = 41; // IPPROTO_IPV6
+/// 协议级别常量 — SOL_SOCKET 因平台而异，IPPROTO_* 全平台一致。
+const SOL_SOCKET: i32 = switch (builtin.os.tag) {
+    .linux => 1, // Linux/Android
+    else => 0xffff, // Darwin/Windows
+};
+const IPPROTO_IP: i32 = 0;
+const IPPROTO_IPV6: i32 = 41;
 
-/// Socket 选项常量（全平台通用值）。
-const SO_REUSEADDR: u32 = 0x0004; // SO_REUSEADDR
-const SO_BINDTODEVICE: u32 = 25; // Linux: SO_BINDTODEVICE
-const IPV6_V6ONLY: u32 = 27; // IPV6_V6ONLY (Linux/macOS/Windows)
-const IP_BOUND_IF: u32 = 25; // macOS: IP_BOUND_IF
-const IP_UNICAST_IF: u32 = 31; // Windows: IP_UNICAST_IF
+/// Socket 选项常量（按平台取值）。
+const SO_REUSEADDR: u32 = switch (builtin.os.tag) {
+    .linux => 2, // Linux/Android
+    else => 4, // Darwin/Windows
+};
+const SO_BINDTODEVICE: u32 = 25; // Linux/Android: 按接口名绑定
+const IPV6_V6ONLY: u32 = switch (builtin.os.tag) {
+    .linux => 26, // Linux/Android
+    else => 27, // Darwin/Windows
+};
+const IP_BOUND_IF: u32 = 25; // Darwin: IPPROTO_IP 级接口索引绑定 (in.h)
+const IPV6_BOUND_IF: u32 = 125; // Darwin: IPPROTO_IPV6 级接口索引绑定 (in6.h)
+const IP_UNICAST_IF: u32 = 31; // Windows: IPPROTO_IP 级出站接口（值须网络字节序）
+const IPV6_UNICAST_IF: u32 = 31; // Windows: IPPROTO_IPV6 级出站接口（值为主机字节序）
 
 /// 出站 socket 绑定选项。
 pub const BindOpts = struct {
@@ -223,17 +239,21 @@ fn bindToDevice(fd: std.posix.socket_t, ifname: []const u8) !void {
     }
 }
 
-/// macOS/iOS: 绑定到接口索引 (IP_BOUND_IF)。
-/// Windows: 绑定到接口索引 (IP_UNICAST_IF)。
+/// macOS/iOS: 绑定到接口索引 (v4: IP_BOUND_IF, v6: IPV6_BOUND_IF)。
+/// Windows: 绑定到接口索引 (v4: IP_UNICAST_IF 网络字节序, v6: IPV6_UNICAST_IF 主机字节序)。
 fn bindToInterfaceIndex(fd: std.posix.socket_t, ifindex: u32, is_ipv6: bool) !void {
-    const level = if (is_ipv6) IPPROTO_IPV6 else IPPROTO_IP;
-    const ndx = ifindex;
+    const level: i32 = if (is_ipv6) IPPROTO_IPV6 else IPPROTO_IP;
     switch (builtin.os.tag) {
         .macos, .ios, .tvos, .watchos => {
-            try sockSetOpt(fd, level, IP_BOUND_IF, std.mem.asBytes(&ndx));
+            // v6 必须用 IPV6_BOUND_IF (125)：IPPROTO_IPV6 级别的 25 是 IPV6_2292PKTOPTIONS
+            const optname: u32 = if (is_ipv6) IPV6_BOUND_IF else IP_BOUND_IF;
+            try sockSetOpt(fd, level, optname, std.mem.asBytes(&ifindex));
         },
         .windows => {
-            try sockSetOpt(fd, level, IP_UNICAST_IF, std.mem.asBytes(&ndx));
+            // MSDN: IP_UNICAST_IF 的选项值须为网络字节序；IPV6_UNICAST_IF 为主机字节序
+            const optname: u32 = if (is_ipv6) IPV6_UNICAST_IF else IP_UNICAST_IF;
+            const ndx: u32 = if (is_ipv6) ifindex else std.mem.nativeToBig(u32, ifindex);
+            try sockSetOpt(fd, level, optname, std.mem.asBytes(&ndx));
         },
         else => return, // 其他平台不支持接口索引绑定，静默跳过
     }
@@ -339,6 +359,10 @@ else
 // ============================================================================
 
 const testing = std.testing;
+
+test "egress: reference all pub decls (lazy-analysis guard)" {
+    testing.refAllDecls(@This());
+}
 
 test "egress: initTcp with default opts" {
     var sock = try Socket.initTcp(.{});

@@ -67,24 +67,30 @@ pub inline fn writeU64Little(bytes: *[8]u8, val: u64) void {
     std.mem.writeInt(u64, bytes, val, .little);
 }
 
+/// 整数类型 T 的字节数 — 必须按 @bitSizeOf 计算而非 @sizeOf：
+/// u24 的 @sizeOf 是 4（含对齐填充）而实际字节数是 3，u40/u48/u56 同理。
+inline fn byteSize(comptime T: type) comptime_int {
+    return @divExact(@bitSizeOf(T), 8);
+}
+
 /// 通用大端读取 — 指定整数类型 T，从切片读取。
 pub inline fn readIntBig(comptime T: type, bytes: []const u8) T {
-    return std.mem.readInt(T, bytes[0..@sizeOf(T)], .big);
+    return std.mem.readInt(T, bytes[0..byteSize(T)], .big);
 }
 
 /// 通用小端读取 — 指定整数类型 T，从切片读取。
 pub inline fn readIntLittle(comptime T: type, bytes: []const u8) T {
-    return std.mem.readInt(T, bytes[0..@sizeOf(T)], .little);
+    return std.mem.readInt(T, bytes[0..byteSize(T)], .little);
 }
 
 /// 通用大端写入 — 指定整数类型 T，写入切片。
 pub inline fn writeIntBig(comptime T: type, bytes: []u8, val: T) void {
-    std.mem.writeInt(T, bytes[0..@sizeOf(T)], val, .big);
+    std.mem.writeInt(T, bytes[0..byteSize(T)], val, .big);
 }
 
 /// 通用小端写入 — 指定整数类型 T，写入切片。
 pub inline fn writeIntLittle(comptime T: type, bytes: []u8, val: T) void {
-    std.mem.writeInt(T, bytes[0..@sizeOf(T)], val, .little);
+    std.mem.writeInt(T, bytes[0..byteSize(T)], val, .little);
 }
 
 // ============================================================
@@ -92,6 +98,10 @@ pub inline fn writeIntLittle(comptime T: type, bytes: []u8, val: T) void {
 // ============================================================
 
 const testing = std.testing;
+
+test "endian: reference all pub decls (lazy-analysis guard)" {
+    testing.refAllDecls(@This());
+}
 
 test "endian: readU16Big" {
     const bytes = [_]u8{ 0x12, 0x34 };
@@ -179,4 +189,30 @@ test "endian: generic writeIntLittle round-trip" {
     var buf: [4]u8 = [_]u8{0} ** 4;
     writeIntLittle(u32, &buf, 0xCAFEBABE);
     try testing.expectEqual(@as(u32, 0xCAFEBABE), readIntLittle(u32, &buf));
+}
+
+test "endian: generic u24 uses bit width not @sizeOf (regression)" {
+    // 回归：曾用 @sizeOf(T) 计算字节数，u24 的 @sizeOf 是 4 → 编译失败/越界
+    var buf: [3]u8 = [_]u8{0} ** 3;
+    writeIntBig(u24, &buf, 0x010203);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x01, 0x02, 0x03 }, &buf);
+    try testing.expectEqual(@as(u24, 0x010203), readIntBig(u24, &buf));
+    writeIntLittle(u24, &buf, 0x010203);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x03, 0x02, 0x01 }, &buf);
+    try testing.expectEqual(@as(u24, 0x010203), readIntLittle(u24, &buf));
+}
+
+test "endian: generic u48 round-trip" {
+    var buf: [6]u8 = [_]u8{0} ** 6;
+    writeIntBig(u48, &buf, 0x0102030405AA);
+    try testing.expectEqual(@as(u48, 0x0102030405AA), readIntBig(u48, &buf));
+}
+
+test "endian: generic u128 round-trip" {
+    var buf: [16]u8 = [_]u8{0} ** 16;
+    const val: u128 = 0xfe80_0000_0000_0000_0000_0000_0000_0001;
+    writeIntBig(u128, &buf, val);
+    try testing.expectEqual(@as(u8, 0xfe), buf[0]);
+    try testing.expectEqual(@as(u8, 0x01), buf[15]);
+    try testing.expectEqual(val, readIntBig(u128, &buf));
 }

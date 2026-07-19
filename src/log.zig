@@ -55,9 +55,12 @@ pub fn getLevel() Level {
 
 /// 返回覆盖了 logFn 的 std.Options。
 /// 调用者在根文件中将此赋值给 pub const std_options。
+/// 注意：必须设置 .log_level = .debug，否则 release 构建会 comptime 剔除
+/// debug 日志，运行时 setLevel(.debug) 无法恢复。
 pub fn logOptions() std.Options {
     return .{
         .logFn = logImpl,
+        .log_level = .debug,
     };
 }
 
@@ -92,11 +95,12 @@ fn platformWrite(
     const msg = std.fmt.allocPrint(std.heap.page_allocator, fmt, args) catch return;
     defer std.heap.page_allocator.free(msg);
 
-    const prefix = if (scope) |s|
-        std.fmt.allocPrint(std.heap.page_allocator, "[{s}] ", .{s}) catch "(?) "
+    const prefix_owned = if (scope) |s|
+        std.fmt.allocPrint(std.heap.page_allocator, "[{s}] ", .{s}) catch null
     else
-        "";
-    defer if (prefix.len > 0) std.heap.page_allocator.free(prefix);
+        null;
+    const prefix: []const u8 = prefix_owned orelse "";
+    defer if (prefix_owned) |p| std.heap.page_allocator.free(p);
 
     // Android 原生程序 stderr 也会输出到 logcat，无需单独调用 __android_log_write
     _ = .{ level, prefix, msg };
@@ -178,6 +182,10 @@ fn logWinGetStdHandle(which: logWin.DWORD) logWin.HANDLE {
 // ============================================================
 
 const testing = std.testing;
+
+test "log: reference all pub decls (lazy-analysis guard)" {
+    testing.refAllDecls(@This());
+}
 
 test "log: init sets level" {
     init(.debug);

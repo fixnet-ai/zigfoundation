@@ -414,8 +414,7 @@ fn testQueue() void {
 // ============================================================================
 fn testEgress() void {
     var sock = foundation.egress.Socket.initTcp(.{ .reuse_addr = true }) catch {
-        // 部分环境可能不支持 socket，不致命失败
-        check("egress", true);
+        check("egress", false);
         return;
     };
     defer sock.close();

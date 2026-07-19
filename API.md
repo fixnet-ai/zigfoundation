@@ -1,10 +1,10 @@
 # zigfoundation API 参考
 
-> **状态**: 13 模块全部实现，173 tests 全绿
+> **状态**: 13 模块全部实现，196 tests 全绿
 >
 > 版本: 0.1.0 | 目标平台: Windows / macOS / Linux / iOS / Android
 >
-> 依赖: Zig std + zli + libyaml C 库
+> 依赖: Zig std + zli + libyaml C 库 | 构建: Zig 0.16.0
 
 ---
 
@@ -606,8 +606,274 @@ defer sock.close();
 
 ---
 
+## 移动端开发环境搭建
+
+> 从裸机（macOS 开发主机）起步，构建可在 iOS 模拟器和 Android 模拟器上运行的 zigfoundation 示例程序并验证全部 13 个模块通过。
+
+### 前置要求
+
+| 工具 | 版本 | 用途 |
+|------|------|------|
+| Zig | 0.16.0 | 编译器 + 构建系统 |
+| Xcode | 16.0+ | iOS SDK + 模拟器运行时 |
+| Android Studio | 2024.2+ | Android SDK + NDK + AVD 管理器 |
+| macOS | 14.0+ | 仅支持 macOS 作为交叉编译主机 |
+
+### 1. Zig 安装
+
+```bash
+# 推荐使用 brew（从最新 Zig 发布版安装）
+brew install zig
+
+# 或手动下载二进制包解压到 ~/bin
+# https://ziglang.org/download/
+
+zig version  # 验证: 0.16.0
+```
+
+### 2. iOS 编译环境
+
+#### 2.1 安装 Xcode 和 Command Line Tools
+
+```bash
+# 从 App Store 安装 Xcode，然后安装 Command Line Tools
+xcode-select --install
+
+# 验证 SDK 可用
+xcrun --sdk iphonesimulator --show-sdk-path
+# → /Applications/Xcode.app/.../iPhoneSimulator26.5.sdk
+xcrun --sdk iphoneos --show-sdk-path
+# → /Applications/Xcode.app/.../iPhoneOS26.5.sdk
+```
+
+#### 2.2 环境变量配置
+
+在 `~/.bash_profile`（或 `~/.zshrc`）中添加：
+
+```bash
+export IOS_SDK_HOME_SIM=$(xcrun --sdk iphonesimulator --show-sdk-path 2>/dev/null)
+export IOS_SDK_HOME_DEVICE=$(xcrun --sdk iphoneos --show-sdk-path 2>/dev/null)
+```
+
+#### 2.3 iOS 模拟器管理
+
+```bash
+# 查看可用运行时
+xcrun simctl list runtimes
+
+# 查看可用设备类型
+xcrun simctl list devicetypes | grep iPhone
+
+# 创建模拟器（如不存在）
+xcrun simctl create "iPhone17Test" "iPhone 17" "com.apple.CoreSimulator.SimRuntime.iOS-26-5"
+
+# 启动模拟器
+xcrun simctl boot "iPhone17Test"
+# 或
+open -a Simulator
+
+# 查看已启动设备
+xcrun simctl list devices | grep Booted
+```
+
+#### 2.4 构建与运行
+
+```bash
+# 构建 iOS 模拟器可执行程序
+zig build example-ios -Dtarget=aarch64-ios-simulator \
+    -Doptimize=ReleaseSmall \
+    -Dsysroot="$IOS_SDK_HOME_SIM"
+
+# 直接在启动的模拟器中运行（无需 .app bundle）
+xcrun simctl spawn booted ./zig-out/bin/zigfoundation-ios-test
+
+# 期望输出
+# [LOG] zigfoundation ios-test: 13/13 passed
+```
+
+#### 2.5 iOS 关键约束
+
+| 约束 | 说明 |
+|------|------|
+| **必须 ReleaseSmall** | Debug 模式交叉链接 dyld 时缺少 `__dyld_get_image_header_containing_address` 符号 |
+| **`/usr/lib` 路径** | MachO linker 自动在 sysroot 前缀查找 `libSystem.tbd`，`build.zig` 中需 `addLibraryPath(.{.cwd_relative = "/usr/lib"})` |
+| **simctl spawn 直连终端** | stdout/stderr 直接输出到终端，无需截图、log stream 或 .app 打包 |
+| **仅静态库** | 静态库编译不需要 `libSystem` 动态链接，可直接产出 `.a` |
+
+### 3. Android 编译环境
+
+#### 3.1 安装 Android Studio 和 NDK
+
+```bash
+# 方法一：从 Android Studio GUI 安装
+# Preferences → Languages & Frameworks → Android SDK → SDK Tools → NDK (Side by side)
+
+# 方法二：命令行安装
+brew install android-studio
+# 首次启动 Android Studio 完成 SDK 初始化向导
+
+# 方法三：仅 sdkmanager 命令行
+# 从 https://developer.android.com/studio#command-line-tools-only 下载
+# 解压到 ~/Library/Android/sdk/cmdline-tools/latest/
+```
+
+安装以下组件：
+
+```bash
+sdkmanager --install \
+    "platform-tools" \
+    "platforms;android-36" \
+    "ndk;30.0.15729638" \
+    "system-images;android-36;aosp_arm64;phone" \
+    "emulator"
+```
+
+#### 3.2 环境变量配置
+
+在 `~/.bash_profile` 中添加：
+
+```bash
+export ANDROID_HOME="$HOME/Library/Android/sdk"
+export ANDROID_SDK_ROOT="$ANDROID_HOME"
+export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/30.0.15729638"
+export PATH="$ANDROID_HOME/platform-tools:$PATH"
+```
+
+#### 3.3 NDK libc 配置文件
+
+Zig 交叉编译 Android 需要 libc 配置文件。创建 `ndk-libc.conf`：
+
+```ini
+# 文件位置：项目根目录或任意路径，构建时通过 -Dlibc-file 指定
+# 格式：key=value
+
+include_dir=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/darwin-x86_64/sysroot/usr/include
+sys_include_dir=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/darwin-x86_64/sysroot/usr/include/aarch64-linux-android
+crt_dir=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/darwin-x86_64/sysroot/usr/lib/aarch64-linux-android/36
+msvc_lib_dir=
+kernel32_lib_dir=
+gcc_dir=
+```
+
+**字段说明：**
+
+| 字段 | 说明 |
+|------|------|
+| `include_dir` | C 标准头文件路径（`stdlib.h`、`string.h` 等） |
+| `sys_include_dir` | 架构特定系统头文件路径（`asm/types.h`、`bits/` 等内核头文件） |
+| `crt_dir` | CRT 目标文件路径（`crtbegin_dynamic.o`、`libc.so` 等），必须指定 API 级别子目录 |
+| `msvc_lib_dir` | Windows cross 用，留空 |
+| `kernel32_lib_dir` | Windows cross 用，留空 |
+| `gcc_dir` | GCC 特定，留空 |
+
+> **注意**：`crt_dir` 的 API 级别子目录（如 `36`）必须与实际安装的 NDK 版本中的目录名一致。
+
+#### 3.4 NDK 库文件 Symlink 修复
+
+NDK 30 中 `.so`/`.a` 文件存放在 `<triple>/<api>/` 子目录下，Zig 编译期在 `<triple>/` 父目录查找。需要创建符号链接：
+
+```bash
+cd "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/darwin-x86_64/sysroot/usr/lib/aarch64-linux-android"
+
+# 将 API 子目录下的库文件链接到父目录
+for f in 36/*.so 36/*.a; do
+    [ -f "$f" ] && ln -sf "$f" "$(basename "$f")"
+done
+
+# 验证
+ls -la libc.so libm.so libdl.so
+# → 应指向 36/libc.so 等
+```
+
+#### 3.5 Android 模拟器管理
+
+```bash
+# 创建 AVD（仅首次）
+avdmanager create avd -n "Pixel9_ARM64" \
+    -k "system-images;android-36;aosp_arm64;phone" \
+    -d "pixel_9"
+
+# 列出已有 AVD
+avdmanager list avd
+
+# 启动模拟器（带 GUI）
+emulator -avd Pixel9_ARM64 &
+
+# 验证设备已连接
+adb devices
+# → List of devices attached
+# → emulator-5554  device
+
+# 等待设备完全启动
+adb wait-for-device
+```
+
+#### 3.6 构建与运行
+
+```bash
+# 构建 Android ARM64 动态库可执行程序
+zig build example-android -Dtarget=aarch64-linux-android \
+    -Doptimize=ReleaseSmall \
+    -Dsysroot="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/darwin-x86_64/sysroot" \
+    -Dlibc-file="$(pwd)/ndk-libc.conf"
+
+# 推送可执行程序到模拟器
+adb push ./zig-out/bin/zigfoundation-android-test /data/local/tmp/
+
+# 运行测试
+adb shell /data/local/tmp/zigfoundation-android-test
+
+# 期望输出
+# [LOG] zigfoundation android-test: 13/13 passed
+```
+
+#### 3.7 Android 关键约束
+
+| 约束 | 说明 |
+|------|------|
+| **必须动态链接** | NDK 30 `libc.a` 包含 Rust std 对象文件，需要 `_Unwind_*` 符号 → 使用 `.linkage = .dynamic` |
+| **adb shell CWD** | `adb shell` 工作目录为 `/data/local/tmp`（可写），JNI 应用的 CWD 为 `/`（不可写） |
+| **Store 路径必须绝对路径** | 移动端无相对路径概念，`Store.init` 需传入 `/data/local/tmp/...` 或 `/tmp/...` 等绝对路径 |
+| **log.zig Android 用 stderr** | `linkSystemLibrary("log")` 无法在 NDK 交叉编译中定位 → Android 平台直接写 stderr，内核自动路由到 logcat |
+| **模拟器 GUI 可选** | `-no-window` 可无头运行，默认带窗口更便于调试 |
+
+### 4. 构建命令速查
+
+```bash
+# ---- iOS ----
+# 模拟器
+zig build example-ios -Dtarget=aarch64-ios-simulator -Doptimize=ReleaseSmall -Dsysroot="$IOS_SDK_HOME_SIM"
+xcrun simctl spawn booted ./zig-out/bin/zigfoundation-ios-test
+
+# 真机（需 Apple Developer 签名）
+zig build example-ios -Dtarget=aarch64-ios -Doptimize=ReleaseSmall -Dsysroot="$IOS_SDK_HOME_DEVICE"
+
+# ---- Android ----
+# 模拟器/真机
+zig build example-android -Dtarget=aarch64-linux-android -Doptimize=ReleaseSmall \
+    -Dsysroot="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/darwin-x86_64/sysroot" \
+    -Dlibc-file="$(pwd)/ndk-libc.conf"
+adb push ./zig-out/bin/zigfoundation-android-test /data/local/tmp/
+adb shell /data/local/tmp/zigfoundation-android-test
+```
+
+### 5. 常见问题排查
+
+| 症状 | 可能原因 | 解决 |
+|------|---------|------|
+| `error: unable to find C compiler` | Xcode Command Line Tools 未安装 | `xcode-select --install` |
+| `dyld: symbol '__dyld_get_image_header_containing_address' not found` | iOS Debug 模式链接问题 | 添加 `-Doptimize=ReleaseSmall` |
+| `undefined reference to '_Unwind_*'` | Android 静态链接 NDK 30 libc.a | 使用 `.linkage = .dynamic` |
+| `cannot find -llog` | Android `linkSystemLibrary("log")` 失败 | 已修复（log.zig 改 stderr，NDK 自动路由到 logcat） |
+| `fatal error: 'stdlib.h' file not found` | sysroot 未传播到 vendored C 库 | 检查 `-Dsysroot` 和 vendor/yaml 架构 include |
+| `adb: no devices/emulators found` | 模拟器未启动 | `emulator -avd <name> &` 等待 `adb wait-for-device` |
+| `Store.init` 失败 (PermissionDenied) | 移动端使用相对路径 | 改为绝对路径：iOS `/tmp/`，Android `/data/local/tmp/` |
+
+---
+
 ## 变更日志
 
 | 版本 | 日期 | 变更 |
 |------|------|------|
+| 0.1.1 | 2026-07-19 | P0-P3 bug 修复 26 项（event/cli/platform/egress/strings/log/store），196 tests，三平台交叉编译 + iOS/Android 模拟器真机验证通过，移动端开发环境文档 |
 | 0.1.0 | 2026-07-18 | 13 模块全部实现，173 tests 全绿，API 文档完成 |

@@ -1,5 +1,42 @@
 # Progress Log
 
+### Phase 7: bug 修复会话 (2026-07-19)
+
+#### P0 修复（Task #7 — 真实环境崩溃）
+- **egress.zig**: Darwin 常量→switch(builtin.os.tag) 分派（AF_INET6/SOL_SOCKET/SO_REUSEADDR/IPV6_V6ONLY）；IPV6_BOUND_IF=125/IPV6_UNICAST_IF=31；bindToInterfaceIndex 按(level,is_ipv6)选择正确 optname + Windows 字节序
+- **queue.zig**: 溢出分支 head+tail 同步推进；tryPop 空路径 reset event
+- **net.zig**: broadcastAddr /0 u5 panic 特判；ip6ToInt/intToIp6 @bitCast→endian.readIntBig/writeIntBig；Cidr6.next byte[0] 修复；isValidIpv6String 完整重写；Cidr4/6.parse 归一化
+- **endian.zig**: byteSize(T) 使用 @divExact(@bitSizeOf(T),8) 代替 @sizeOf(T)
+- **yaml.zig**: 空文档 parse→EmptyDocument 错误
+- **store.zig**: MAX_KEY_LEN 125；空值 round-trip 与缺失区分；TTL 饱和加法；cleanExpired iterate=true + readPositionalAll 替代 readFileAlloc Limit.limited；tmpDir → .zig-cache/tmp
+- 测试: 173→188 (P0 期间)
+
+#### P1 修复（Task #8 — 下游编译/运行时错误）
+- **cli.zig**: 完整重写 — RootIo 静态存储消除悬垂 buffer；stdoutDrain 消费 buffer 清 end 防死循环；stdinStream EOF→EndOfStream + writableSliceGreedy/advance 防覆写；run() 签名 args→std.process.Args；POSIX sigemptyset()/sigaction/fork/setsid/chdir/dup2 全部使用 libc 声明；waitForSignal 统一轮询 + last_signal 原子变量
+- **13 模块 refAllDecls 守卫**: buffer/ring/endian/platform/net/strings/cli/log/yaml/store/event/queue/egress + foundation barrel — 全部 196 测试通过
+- **platform.zig**: isMobile .android→builtin.abi.isAndroid()；monoNanos i64 溢出→i128 扩建；absoluteMillis epoch 1601→1970 修正
+- ip6ToInt (H5) 已在 P0 批次中修复
+
+#### P2 修复（Task #9 — 示例假 PASS）
+- android/test_runner.zig: check("egress",true)→Socket.initTcp 实际测试
+- cli+android+ios main.zig: catch { check("egress",true) }→false（3 文件）
+- android/main.zig: testLog restores .warn→.info；store path→/data/local/tmp 绝对路径
+- ios/main.zig: store path→/tmp 绝对路径
+
+#### P3 修复（Task #10 — MEDIUM 子集）
+- **event.zig**: timedWait POSIX/Windows 均添加虚假唤醒重试循环；set() POSIX/Windows 移除 early-return 确保 setFromSignal 后亦广播
+- **strings.zig**: splitTrim trim 集 " \t\r"→" \t\r\n"
+- **log.zig**: logOptions 添加 .log_level=.debug（release 构建免 comptime 剔除）；prefix OOM fallback "(?) " 静态串→null 追踪防 free UB
+- **store.zig**: doc "sync 后 rename"→明确注明无显式 fsync
+
+#### 回归验证（Task #11）
+- `zig build test` 196/196 ✅
+- `zig fmt --check` ✅
+- CLI 示例 macOS 13/13 ✅
+- 交叉编译 Linux aarch64 ✅
+- 交叉编译 Windows aarch64 ✅
+- 测试增长: 173→196 (+23: 17 P0 修复测试 + 6 refAllDecls 守卫)
+
 ### 代码审查会话 — 逐文件 bug 审查 (2026-07-19)
 - **Status:** complete（审查完成，修复待用户决策）
 - Actions taken:

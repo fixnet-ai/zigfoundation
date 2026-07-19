@@ -5,7 +5,7 @@
 //! 每个键存储为独立文件，路径为 `{dir}/{hex(key)}`。
 //! 文件格式：8 字节到期时间戳 (u64, 大端序, 0 = 永不过期) + 值字节。
 //!
-//! 原子写入：先写 `{key}.tmp`，sync，再 rename 到正式文件名。
+//! 原子写入：先写 `{key}.tmp`，再 rename 到正式文件名（不显式 fsync，依赖 OS 回写）。
 //!
 //! ## 平台
 //!
@@ -13,8 +13,9 @@
 //!
 //! ## 约束
 //!
-//! - 键最大 256 字节（编码后文件名 ~512 字节）
+//! - 键最大 125 字节（hex 文件名 250 字节 + `.tmp` 后缀 = 254，≤ 常见文件系统 255 文件名上限）
 //! - 值最大 16 MB
+//! - 空值是合法内容，与"键不存在"（null）可区分
 //! - 不绑定任何业务逻辑（DNS、代理等）
 
 const std = @import("std");
@@ -24,8 +25,10 @@ const endian = @import("endian.zig");
 /// 文件头部大小：8 字节到期时间戳
 const HEADER_SIZE: usize = 8;
 
-/// 键最大字节长度
-pub const MAX_KEY_LEN: usize = 256;
+/// 键最大字节长度。
+/// hex 编码文件名为 2×key.len，加 ".tmp" 后缀须 ≤ 255（常见文件系统单文件名上限）：
+/// 2×125 + 4 = 254。曾为 256，实际 key ≥ 126 时 set() 必然失败。
+pub const MAX_KEY_LEN: usize = 125;
 
 /// 值最大字节长度
 pub const MAX_VALUE_LEN: usize = 16 * 1024 * 1024; // 16 MB
@@ -78,13 +81,15 @@ pub const Store = struct {
         const file_path = try self.keyPath(key);
         defer self.allocator.free(file_path);
 
-        // 读取整个文件内容
+        // 读取整个文件内容。
+        // limit 语义是"达到或超过即报 StreamTooLong"，须比最大合法内容多 1，
+        // 否则值恰好为 MAX_VALUE_LEN 的条目会读取失败。
         const data = std.Io.Dir.readFileAlloc(
             .cwd(),
             self.io,
             file_path,
             self.allocator,
-            std.Io.Limit.limited(MAX_VALUE_LEN + HEADER_SIZE),
+            std.Io.Limit.limited(HEADER_SIZE + MAX_VALUE_LEN + 1),
         ) catch |err| {
             if (err == error.FileNotFound) return null;
             return err;
@@ -102,8 +107,8 @@ pub const Store = struct {
         }
 
         const value = data[HEADER_SIZE..];
-        if (value.len == 0) return null;
 
+        // 空值是合法存储内容（与"键不存在"返回 null 区分）
         // 复制值给调用者（readFileAlloc 的所有权在我们手里）
         const owned = try self.allocator.alloc(u8, value.len);
         @memcpy(owned, value);
@@ -111,7 +116,7 @@ pub const Store = struct {
     }
 
     /// 写入键值对。`ttl_seconds` 为 0 时永不过期。
-    /// 使用原子写入：先写临时文件，sync 后 rename。
+    /// 使用原子写入：先写临时文件，rename 原子替换（无显式 fsync，依赖 OS 回写）。
     pub fn set(self: *Store, key: []const u8, value: []const u8, ttl_seconds: u64) !void {
         if (key.len == 0 or key.len > MAX_KEY_LEN) return error.InvalidKey;
         if (value.len > MAX_VALUE_LEN) return error.ValueTooLarge;
@@ -119,8 +124,8 @@ pub const Store = struct {
         const file_path = try self.keyPath(key);
         defer self.allocator.free(file_path);
 
-        // 计算到期时间戳
-        const expiry: u64 = if (ttl_seconds > 0) nowSeconds() + ttl_seconds else 0;
+        // 计算到期时间戳（饱和加法防止 ttl 极大值回绕成"已过期"）
+        const expiry: u64 = if (ttl_seconds > 0) nowSeconds() +| ttl_seconds else 0;
 
         // 构建文件内容：header + value
         const data_len = HEADER_SIZE + value.len;
@@ -163,7 +168,9 @@ pub const Store = struct {
 
     /// 清理所有过期条目。返回清理的条目数。
     pub fn cleanExpired(self: *Store) !usize {
-        const dir = try std.Io.Dir.openDirAbsolute(self.io, self.dir_path, .{});
+        // 必须显式 .iterate = true：默认 OpenOptions 打开的目录不可迭代
+        // （曾用 .{} 导致 iterate() 一个条目都不产出，cleanExpired 永远返回 0）。
+        const dir = try std.Io.Dir.openDirAbsolute(self.io, self.dir_path, .{ .iterate = true });
         defer dir.close(self.io);
 
         const now = nowSeconds();
@@ -180,19 +187,18 @@ pub const Store = struct {
             const entry_path = try std.fs.path.join(self.allocator, &.{ self.dir_path, e.name });
             defer self.allocator.free(entry_path);
 
-            // 只读取头部 8 字节检查到期时间
-            const data = std.Io.Dir.readFileAlloc(
-                .cwd(),
-                self.io,
-                entry_path,
-                self.allocator,
-                std.Io.Limit.limited(HEADER_SIZE),
-            ) catch continue;
-            defer self.allocator.free(data);
+            // 只读取头部 8 字节检查到期时间。
+            // 不能用 readFileAlloc + Limit.limited(8)：该 limit 语义是
+            // "内容达到或超过上限即报 StreamTooLong"，任何带值的条目都会被误跳过。
+            var header: [HEADER_SIZE]u8 = undefined;
+            {
+                var file = std.Io.Dir.openFileAbsolute(self.io, entry_path, .{}) catch continue;
+                defer file.close(self.io); // 删除前必须先关闭（Windows 不允许删除打开中的文件）
+                const n = file.readPositionalAll(self.io, &header, 0) catch continue;
+                if (n < HEADER_SIZE) continue;
+            }
 
-            if (data.len < HEADER_SIZE) continue;
-
-            const expiry: u64 = endian.readU64Big(data[0..HEADER_SIZE]);
+            const expiry: u64 = endian.readU64Big(&header);
             if (expiry > 0 and now >= expiry) {
                 std.Io.Dir.deleteFileAbsolute(self.io, entry_path) catch continue;
                 cleaned += 1;
@@ -244,24 +250,27 @@ fn nowSeconds() u64 {
 
 const testing = std.testing;
 
-/// 创建临时测试目录（绝对路径）
+/// 创建临时测试目录（绝对路径）。
+/// 每次调用先清空同名目录再重建，保证测试从干净状态开始，
+/// 且不在 .zig-cache/tmp 下逐次累积随机残留目录。
 fn tmpDir(allocator: std.mem.Allocator, suffix: []const u8) ![]const u8 {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
+    const rel_dir = try std.fs.path.join(allocator, &.{
+        ".zig-cache", "tmp", "zigfoundation-store-tests", suffix,
+    });
+    defer allocator.free(rel_dir);
+
+    const cwd_dir = std.Io.Dir.cwd();
+    cwd_dir.deleteTree(std.testing.io, rel_dir) catch {};
+    cwd_dir.createDirPath(std.testing.io, rel_dir) catch |err| {
+        if (err != error.PathAlreadyExists) return err;
+    };
 
     // 获取当前工作目录的绝对路径
     var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
     const cwd_ptr = std.c.getcwd(&cwd_buf, cwd_buf.len) orelse return error.GetCwdFailed;
     const cwd_path: []const u8 = std.mem.sliceTo(cwd_ptr, 0);
 
-    const rel_dir = try std.fs.path.join(allocator, &.{
-        ".zig-cache", "tmp", tmp.sub_path[0..], suffix,
-    });
-    defer allocator.free(rel_dir);
-
-    const dir = try std.fs.path.join(allocator, &.{ cwd_path, rel_dir });
-    _ = std.Io.Dir.cwd().createDirPath(std.testing.io, rel_dir) catch {};
-    return dir;
+    return std.fs.path.join(allocator, &.{ cwd_path, rel_dir });
 }
 
 test "store: init and deinit" {
@@ -343,9 +352,12 @@ test "store: expiry — get returns null after TTL" {
     defer s.deinit();
 
     try s.set("ephemeral", "data", 1);
-    _ = std.c.nanosleep(&.{ .sec = 0, .nsec = 1200 * std.time.ns_per_ms }, null);
+    // 注意 nsec 必须 < 1e9：曾写 1200ms 的纯 nsec (1.2e9) 触发 EINVAL 零睡眠，
+    // 使本测试从未真正等到过期。1.3s > TTL 1s，秒级时间戳下必然过期。
+    _ = std.c.nanosleep(&.{ .sec = 1, .nsec = 300 * std.time.ns_per_ms }, null);
     const result = try s.get("ephemeral");
-    if (result) |r| testing.allocator.free(r);
+    defer if (result) |r| testing.allocator.free(r);
+    try testing.expect(result == null); // 曾缺失此核心断言
 }
 
 test "store: cleanExpired removes expired entries" {
@@ -358,10 +370,14 @@ test "store: cleanExpired removes expired entries" {
     try s.set("expire_soon", "data", 1);
     try s.set("permanent", "forever", 0);
 
-    _ = std.c.nanosleep(&.{ .sec = 0, .nsec = 1200 * std.time.ns_per_ms }, null);
+    _ = std.c.nanosleep(&.{ .sec = 1, .nsec = 300 * std.time.ns_per_ms }, null);
 
     const cleaned = try s.cleanExpired();
-    _ = cleaned;
+    try testing.expectEqual(@as(usize, 1), cleaned); // 曾写 `_ = cleaned` 无断言
+
+    const gone = try s.get("expire_soon");
+    defer if (gone) |r| testing.allocator.free(r);
+    try testing.expect(gone == null);
 
     const perm = try s.get("permanent");
     defer if (perm) |r| testing.allocator.free(r);
@@ -419,4 +435,42 @@ test "store: empty key returns error" {
     try testing.expectError(error.InvalidKey, s.set("", "value", 0));
     try testing.expectError(error.InvalidKey, s.get(""));
     try testing.expectError(error.InvalidKey, s.delete(""));
+}
+
+test "store: key at MAX_KEY_LEN works, over limit rejected (regression)" {
+    // 回归：MAX_KEY_LEN 曾为 256，hex 文件名 512 字节超过文件系统 255 上限，
+    // key ≥ 126 时 set() 必然失败 — 上限本身不可实现。
+    const dir = try tmpDir(testing.allocator, "store_max_key");
+    defer testing.allocator.free(dir);
+
+    var s = try Store.init(testing.allocator, std.testing.io, dir);
+    defer s.deinit();
+
+    const max_key = [_]u8{'k'} ** MAX_KEY_LEN;
+    try s.set(&max_key, "v", 0);
+    const result = try s.get(&max_key);
+    defer if (result) |r| testing.allocator.free(r);
+    try testing.expectEqualStrings("v", result.?);
+
+    const over_key = [_]u8{'k'} ** (MAX_KEY_LEN + 1);
+    try testing.expectError(error.InvalidKey, s.set(&over_key, "v", 0));
+    try testing.expectError(error.InvalidKey, s.get(&over_key));
+    try testing.expectError(error.InvalidKey, s.delete(&over_key));
+}
+
+test "store: empty value round-trips, distinct from missing key" {
+    const dir = try tmpDir(testing.allocator, "store_empty_value");
+    defer testing.allocator.free(dir);
+
+    var s = try Store.init(testing.allocator, std.testing.io, dir);
+    defer s.deinit();
+
+    try s.set("empty", "", 0);
+    const result = try s.get("empty");
+    try testing.expect(result != null); // 曾把空值当作"不存在"返回 null
+    try testing.expectEqual(@as(usize, 0), result.?.len);
+    testing.allocator.free(result.?);
+
+    const missing = try s.get("never_set");
+    try testing.expect(missing == null);
 }

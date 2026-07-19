@@ -205,19 +205,13 @@ fn testStore() void {
     defer io_instance.deinit();
     const io = io_instance.io();
 
-    const cwd = std.Io.Dir.cwd();
-    // 使用 tmp 目录（iOS 沙箱内）
-    const tmp_path = "tmp/zigfoundation-ios-test";
-    cwd.createDirPath(io, tmp_path) catch {
+    // iOS: use /tmp (system tmp directory, sandbox-accessible)
+    const abs_path = "/tmp/zigfoundation-ios-test-store";
+    std.Io.Dir.cwd().createDirPath(io, abs_path) catch {
         check("store", false);
         return;
     };
-    defer _ = cwd.deleteTree(io, tmp_path) catch {};
-
-    const abs_path = cwd.realPathFileAlloc(io, tmp_path, alloc) catch {
-        check("store", false);
-        return;
-    };
+    defer _ = std.Io.Dir.cwd().deleteTree(io, abs_path) catch {};
 
     var store = foundation.store.Store.init(alloc, io, abs_path) catch {
         check("store", false);
@@ -265,8 +259,7 @@ fn testEgress() void {
     var sock = foundation.egress.Socket.initUdp(.{
         .interface_index = 1, // iOS: IP_BOUND_IF
     }) catch {
-        // 部分环境可能失败，不视为严重错误
-        check("egress", true);
+        check("egress", false);
         return;
     };
     defer sock.close();

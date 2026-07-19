@@ -144,7 +144,7 @@ pub const SplitTrimIterator = struct {
     /// 返回下一段已去除首尾空白的切片，无更多段时返回 null。
     pub fn next(self: *SplitTrimIterator) ?[]const u8 {
         while (self.inner.next()) |part| {
-            const trimmed = std.mem.trim(u8, part, " \t\r");
+            const trimmed = std.mem.trim(u8, part, " \t\r\n");
             if (trimmed.len > 0) return trimmed;
         }
         return null;
@@ -156,6 +156,10 @@ pub const SplitTrimIterator = struct {
 // ============================================================
 
 const testing = std.testing;
+
+test "strings: reference all pub decls (lazy-analysis guard)" {
+    testing.refAllDecls(@This());
+}
 
 // ---- 大小写转换测试 ----
 

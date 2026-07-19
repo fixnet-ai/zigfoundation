@@ -10,7 +10,7 @@
 //! ```
 //! const yaml = @import("zigfoundation").yaml;
 //!
-//! var doc = try yaml.Document.parse(allocator,
+//! var doc = try yaml.Document.parse(
 //!     \\server:
 //!     \\  port: 8080
 //!     \\  hosts:
@@ -32,6 +32,7 @@ pub const Error = error{
     ParseFailed,
     OutOfMemory,
     InvalidNodeType,
+    EmptyDocument,
 };
 
 /// 已解析的 YAML 文档。
@@ -42,6 +43,7 @@ pub const Document = struct {
     doc: yaml_c.yaml_document_t,
 
     /// 从 YAML 字符串解析文档。
+    /// 空流或纯注释文件返回 `error.EmptyDocument`（不产出无根文档）。
     pub fn parse(content: []const u8) !Document {
         var parser: yaml_c.yaml_parser_t = undefined;
         if (yaml_c.yaml_parser_initialize(&parser) == 0) {
@@ -56,6 +58,13 @@ pub const Document = struct {
             return error.ParseFailed;
         }
 
+        // 空流/纯注释：load 返回成功但文档无根节点。在此拒绝并释放，
+        // 保证 root() 永远有根可取（曾经 root() 对空文档 @panic 使进程 abort）。
+        if (yaml_c.yaml_document_get_root_node(&doc) == null) {
+            yaml_c.yaml_document_delete(&doc);
+            return error.EmptyDocument;
+        }
+
         return Document{ .doc = doc };
     }
 
@@ -66,9 +75,10 @@ pub const Document = struct {
     }
 
     /// 获取文档根节点。
+    /// `parse()` 已拒绝空文档，此处根节点必然存在。
     pub fn root(self: *Document) Node {
         const node_ptr = yaml_c.yaml_document_get_root_node(&self.doc) orelse
-            @panic("YAML document has no root node");
+            unreachable; // parse() 保证非空文档
         return Node{
             .doc = &self.doc,
             .ptr = node_ptr,
@@ -359,11 +369,16 @@ test "yaml: mapping iteration" {
     try testing.expectEqual(@as(usize, 2), count);
 }
 
-test "yaml: parse empty document" {
-    const content = "";
-    _ = Document.parse(content) catch |err| {
-        try testing.expect(err == error.ParseFailed);
-    };
+test "yaml: empty or comment-only document returns EmptyDocument (regression)" {
+    // 回归 1：空流 load 成功但无根节点，root() 曾 @panic 使进程 abort。
+    // 回归 2：旧测试写作 `_ = parse(..) catch |err| { ... }`，parse 实际成功时
+    //         断言从不执行，且成功返回的 Document 泄漏 C 堆内存。
+    try testing.expectError(error.EmptyDocument, Document.parse(""));
+    try testing.expectError(error.EmptyDocument, Document.parse("# 只有注释\n"));
+}
+
+test "yaml: malformed document returns ParseFailed" {
+    try testing.expectError(error.ParseFailed, Document.parse("[unclosed"));
 }
 
 test "yaml: seqGet on non-sequence returns null" {

@@ -25,8 +25,8 @@ pub const isDarwin = switch (native_os) {
 pub const isLinux = native_os == .linux;
 pub const isWindows = native_os == .windows;
 pub const isMobile = switch (native_os) {
-    .ios, .tvos, .watchos, .visionos, .android => true,
-    else => false,
+    .ios, .tvos, .watchos, .visionos => true,
+    else => builtin.abi.isAndroid(),
 };
 
 // ============================================================
@@ -72,7 +72,8 @@ pub fn monoNanos() i64 {
         if (Win32.QueryPerformanceFrequency(&freq) == 0 or freq <= 0) return 0;
         var counter: i64 = 0;
         if (Win32.QueryPerformanceCounter(&counter) == 0) return 0;
-        return @divTrunc(counter * std.time.ns_per_s, freq);
+        const wide = @as(i128, counter) * std.time.ns_per_s;
+        return @intCast(@divTrunc(wide, freq));
     }
     var ts: c.timespec = undefined;
     _ = c.clock_gettime(c.CLOCK.MONOTONIC, &ts);
@@ -88,7 +89,9 @@ pub fn absoluteMillis() i64 {
         };
         var ft: u64 = 0;
         Win32.GetSystemTimeAsFileTime(&ft);
-        return @as(i64, @intCast(ft / 10_000));
+        // Windows FILETIME epoch is 1601-01-01; Unix epoch is 1970-01-01.
+        const ft_ms: i64 = @intCast(ft / 10_000);
+        return ft_ms - 11644473600000; // 1601→1970 epoch delta in ms
     }
     var ts: c.timespec = undefined;
     _ = c.clock_gettime(c.CLOCK.REALTIME, &ts);
@@ -187,6 +190,10 @@ fn detectDnsFromResolvConf(allocator: std.mem.Allocator) ?[]const u8 {
 // ============================================================
 
 const testing = std.testing;
+
+test "platform: reference all pub decls (lazy-analysis guard)" {
+    testing.refAllDecls(@This());
+}
 
 test "platform: detection compiles (compile-time constants)" {
     try testing.expect(isDarwin or isLinux or isWindows);

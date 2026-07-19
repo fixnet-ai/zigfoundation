@@ -84,8 +84,10 @@ pub const PosixResetEvent = struct {
 
     /// 设置事件并唤醒所有等待者。后续 `wait()` 调用立即返回，直到 `reset()` 被调用。
     /// 可从任意线程安全调用。
+    /// 始终广播条件变量（即使 state 已置位），以兼容 setFromSignal
+    /// 仅做原子存储而不广播的场景。
     pub fn set(self: *PosixResetEvent) void {
-        if (self.state.swap(1, .acq_rel) != 0) return;
+        self.state.store(1, .release);
         _ = std.c.pthread_mutex_lock(&self.mutex);
         _ = std.c.pthread_cond_broadcast(&self.cond);
         _ = std.c.pthread_mutex_unlock(&self.mutex);
@@ -112,12 +114,13 @@ pub const PosixResetEvent = struct {
     /// 阻塞直到事件被设置或 `timeout_ms` 超时。
     /// 截止时间计算为 CLOCK_REALTIME 中的**绝对**时间（`pthread_cond_timedwait` 要求）。
     /// 返回 `true` 表示事件已设置，`false` 表示超时。
+    /// 包含虚假唤醒重试循环：pthread_cond_timedwait 可能无原因返回，
+    /// 重试直到状态变更或 deadline 过期。
     pub fn timedWait(self: *PosixResetEvent, timeout_ms: u32) bool {
         if (self.state.load(.acquire) != 0) return true;
         if (timeout_ms == 0) return false;
         _ = std.c.pthread_mutex_lock(&self.mutex);
         defer _ = std.c.pthread_mutex_unlock(&self.mutex);
-        if (self.state.load(.acquire) != 0) return true;
 
         // 计算 CLOCK_REALTIME 中的绝对截止时间。
         const ts_template: std.c.timespec = undefined;
@@ -137,8 +140,12 @@ pub const PosixResetEvent = struct {
             deadline.nsec -= 1_000_000_000;
         }
 
-        const rc = std.c.pthread_cond_timedwait(&self.cond, &self.mutex, &deadline);
-        return rc == .SUCCESS and self.state.load(.acquire) != 0;
+        // 重试循环：pthread_cond_timedwait 可能虚假唤醒（spurious wakeup）
+        while (self.state.load(.acquire) == 0) {
+            const rc = std.c.pthread_cond_timedwait(&self.cond, &self.mutex, &deadline);
+            if (rc != .SUCCESS) return false; // ETIMEDOUT
+        }
+        return true;
     }
 
     /// 清除信号。仅重置状态，不唤醒等待者。
@@ -179,7 +186,7 @@ pub const WindowsResetEvent = struct {
     }
 
     pub fn set(self: *WindowsResetEvent) void {
-        if (self.state.swap(1, .acq_rel) != 0) return;
+        self.state.store(1, .release);
         AcquireSRWLockExclusive(&self.srwlock);
         WakeAllConditionVariable(&self.cond);
         ReleaseSRWLockExclusive(&self.srwlock);
@@ -203,9 +210,17 @@ pub const WindowsResetEvent = struct {
         if (timeout_ms == 0) return false;
         AcquireSRWLockExclusive(&self.srwlock);
         defer ReleaseSRWLockExclusive(&self.srwlock);
-        if (self.state.load(.acquire) != 0) return true;
-        _ = SleepConditionVariableSRW(&self.cond, &self.srwlock, timeout_ms, 0);
-        return self.state.load(.acquire) != 0;
+        // Retry on spurious wakeup until state changes or timeout expires
+        const tick = struct {
+            extern "kernel32" fn GetTickCount64() callconv(.winapi) u64;
+        };
+        const start = tick.GetTickCount64();
+        while (self.state.load(.acquire) == 0) {
+            const elapsed_ms: u64 = tick.GetTickCount64() - start;
+            if (elapsed_ms >= timeout_ms) return false;
+            _ = SleepConditionVariableSRW(&self.cond, &self.srwlock, @intCast(timeout_ms - elapsed_ms), 0);
+        }
+        return true;
     }
 
     pub fn reset(self: *WindowsResetEvent) void {
@@ -222,6 +237,10 @@ pub const WindowsResetEvent = struct {
 // ============================================================================
 
 const testing = std.testing;
+
+test "event: reference all pub decls (lazy-analysis guard)" {
+    testing.refAllDecls(@This());
+}
 
 test "event: ResetEvent set/wait notifies" {
     var e: PosixResetEvent = .{};

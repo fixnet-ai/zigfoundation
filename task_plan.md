@@ -4,7 +4,7 @@
 从 zigproxy/zproxy/zigtun 提取公共组件，实现 13 个工业级基础模块（buffer/ring/endian/platform/net/strings/cli/log/yaml/store/event/queue/egress），100% 单元测试覆盖，五平台支持。
 
 ## Current Phase
-Phase 6 (集成验证)
+Phase 7 (bug 修复 — 全库审查 62 项发现)
 
 ## Phases
 
@@ -140,6 +140,15 @@ Phase 6 (集成验证)
 - [x] 日志问题闭环：spawn 路径 stdout/stderr 直连终端，无需截图 / log stream / .app bundle
 - [x] 回归：`zig build test` 173/173 ✅ + `zig fmt --check` ✅
 - [x] `.gitignore` 追加 `examples/ios/.build/`（iOS .app 构建产物）
+- **Status:** complete
+
+### Phase 7: bug 修复 — 全库代码审查 62 项发现（明细见 findings.md「全库代码审查」章节）
+- [x] 备份：commit 67d925c + tag `pre-bugfix-20260719` 已 push
+- [x] P0 崩溃类：H1 egress 常量按 OS 分派 / H2 IPV6_BOUND_IF / H11 yaml 空文档 / H4 net /0 panic / H3 queue tail / H12 store MAX_KEY_LEN
+- [x] P1 编译/运行时类：H6-H9 cli.zig (I/O 重写：RootIo 静态存储 / drain 清 end / EOF→EndOfStream / fork/sigaction/sigemptyset/api 修复) + 13 模块 refAllDecls 守卫 + H5 ip6ToInt + H10 monoNanos (i128 扩建 + epoch 修正)
+- [x] P2 示例假 PASS 类：H13 硬编码 PASS→真实测试 / H14 catch-as-pass ×3→false / H15 testLog .warn→.info / H16 JNI store 路径→绝对路径 (android + ios)
+- [x] P3 MEDIUM: event timedWait 虚假唤醒重试 + set/setFromSignal 广播竞态 / strings splitTrim 缺\n / log log_level+.debug+prefix OOM UB / store doc sync 修正
+- [x] 回归验证：zig build test 196/196 全绿 + zig fmt OK + 三平台交叉编译 + CLI 示例 13/13
 - **Status:** complete
 
 ## Key Questions

@@ -147,7 +147,7 @@ fn testLog() void {
     foundation.log.init(.info);
     foundation.log.setLevel(.err);
     const ok = foundation.log.getLevel() == .err;
-    foundation.log.setLevel(.warn);
+    foundation.log.setLevel(.info);
     check("log", ok);
 }
 
@@ -180,18 +180,13 @@ fn testStore() void {
     defer io_instance.deinit();
     const io = io_instance.io();
 
-    const cwd = std.Io.Dir.cwd();
-    const tmp_path = "tmp/zigfoundation-android-test";
-    cwd.createDirPath(io, tmp_path) catch {
+    // Android: use /data/local/tmp (world-writable, no root needed)
+    const abs_path = "/data/local/tmp/zigfoundation-android-test-store";
+    std.Io.Dir.cwd().createDirPath(io, abs_path) catch {
         check("store", false);
         return;
     };
-    defer _ = cwd.deleteTree(io, tmp_path) catch {};
-
-    const abs_path = cwd.realPathFileAlloc(io, tmp_path, alloc) catch {
-        check("store", false);
-        return;
-    };
+    defer _ = std.Io.Dir.cwd().deleteTree(io, abs_path) catch {};
 
     var store = foundation.store.Store.init(alloc, io, abs_path) catch {
         check("store", false);
@@ -239,7 +234,7 @@ fn testEgress() void {
     var sock = foundation.egress.Socket.initUdp(.{
         .interface_name = "lo", // Android: SO_BINDTODEVICE (Linux 内核)
     }) catch {
-        check("egress", true);
+        check("egress", false);
         return;
     };
     defer sock.close();

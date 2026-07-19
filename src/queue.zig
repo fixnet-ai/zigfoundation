@@ -106,8 +106,11 @@ pub fn Queue(comptime T: type, comptime capacity: usize) type {
                 self.tail = (self.tail + 1) % capacity;
                 self.count += 1;
             } else {
-                // 溢出：覆盖最旧的条目（在 head），推进 head。
-                self.buffer[self.head] = item;
+                // 溢出：覆盖最旧的条目。满时 head == tail，新条目写入该槽后
+                // head/tail 必须同步推进，否则后续 pop+push 会覆盖最新条目
+                // 并重复投递已弹出的旧值。
+                self.buffer[self.tail] = item;
+                self.tail = (self.tail + 1) % capacity;
                 self.head = (self.head + 1) % capacity;
             }
             self.unlockMutex();
@@ -115,11 +118,16 @@ pub fn Queue(comptime T: type, comptime capacity: usize) type {
         }
 
         /// FIFO 出队。队列空时返回 `null`。
-        /// 队列排空时重置 event，使下一次 `wait()` 阻塞直到下一次 `push()`。
+        /// 队列已空或排空时重置 event，使下一次 `wait()` 阻塞直到下一次 `push()`。
         pub fn tryPop(self: *Self) ?T {
             self.lockMutex();
             defer self.unlockMutex();
-            if (self.count == 0) return null;
+            if (self.count == 0) {
+                // push() 是先解锁再 set()，消费者可能在 set() 之前就把条目取走，
+                // 留下"event 已置位但队列为空"的状态。此处重置避免 wait() 忙转。
+                self.event.reset();
+                return null;
+            }
             const item = self.buffer[self.head];
             self.head = (self.head + 1) % capacity;
             self.count -= 1;
@@ -206,6 +214,27 @@ test "queue: overflow overwrites oldest" {
     try testing.expectEqual(@as(u32, 99), last.?);
 
     try testing.expect(q.tryPop() == null);
+}
+
+test "queue: push after overflow then pop keeps newest (regression)" {
+    // 回归：溢出分支曾只推进 head 不推进 tail，导致溢出后 pop+push
+    // 覆盖最新条目并重复投递已弹出的旧值。
+    var q: SmallQueue = .{};
+    q.init();
+    defer q.deinit();
+    for (0..4) |i| q.push(@intCast(i)); // [0,1,2,3]
+    q.push(99); // 溢出，0 被丢弃 → 逻辑内容 {1,2,3,99}
+    const popped = q.tryPop();
+    try testing.expectEqual(@as(u32, 1), popped.?); // 弹出最旧的 1
+    q.push(50); // → 逻辑内容 {2,3,99,50}
+
+    var buf: [4]u32 = undefined;
+    const n = q.drain(&buf);
+    try testing.expectEqual(@as(usize, 4), n);
+    try testing.expectEqual(@as(u32, 2), buf[0]);
+    try testing.expectEqual(@as(u32, 3), buf[1]);
+    try testing.expectEqual(@as(u32, 99), buf[2]); // 曾被错误覆盖为 50
+    try testing.expectEqual(@as(u32, 50), buf[3]); // 曾被错误投递为陈旧值 1
 }
 
 test "queue: cross-thread push/tryPop" {

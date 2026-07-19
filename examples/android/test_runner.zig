@@ -191,5 +191,9 @@ fn testQueue() void {
 
 fn testEgress() void {
     // Android 是 Linux 内核，使用 interface_name (SO_BINDTODEVICE)
+    _ = foundation.egress.Socket.initTcp(.{}) catch {
+        check("egress", false);
+        return;
+    };
     check("egress", true);
 }

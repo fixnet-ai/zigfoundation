@@ -85,14 +85,17 @@ pub fn intToIp4(val: u32) Ip4Addr {
     };
 }
 
-/// IPv6 字节（网络序）→ u128。
+/// IPv6 字节（网络序）→ u128（主机序，byte[0] 在 MSB，与 ip4ToInt 语义一致）。
+/// 例: ::1 → 1，fe80::1 → 0xfe80_0000_..._0001
 pub fn ip6ToInt(bytes: []const u8) u128 {
-    return @as(u128, @bitCast(bytes[0..16].*));
+    return endian.readIntBig(u128, bytes);
 }
 
-/// u128 → IPv6 字节（网络序）。
+/// u128（主机序）→ IPv6 字节（网络序，MSB 在 byte[0]）。
 pub fn intToIp6(val: u128) Ip6Addr {
-    return @bitCast(val);
+    var out: Ip6Addr = undefined;
+    endian.writeIntBig(u128, &out, val);
+    return out;
 }
 
 // ============================================================
@@ -175,8 +178,8 @@ pub fn isValidIpv4String(str: []const u8) bool {
 }
 
 /// 验证 IPv6 字符串格式。
-/// 支持 RFC 4291 扩展格式（恰好 7 个冒号、8 组）和压缩格式（::）。
-/// 可选方括号（[addr] 或 [addr]:port）。
+/// 支持 RFC 4291 扩展格式（8 组）和压缩格式（::，至少压缩一个零组）。
+/// 可选方括号（[addr] 或 [addr]:port）。不支持 IPv4 嵌入形式（::ffff:1.2.3.4）。
 pub fn isValidIpv6String(str: []const u8) bool {
     const inner: []const u8 = if (str.len >= 2 and str[0] == '[')
         if (std.mem.indexOfScalar(u8, str, ']')) |close_idx|
@@ -188,21 +191,24 @@ pub fn isValidIpv6String(str: []const u8) bool {
 
     if (inner.len < 2 or inner.len > 45) return false;
 
-    var colons: usize = 0;
+    // 前导单冒号非法（"::" 开头除外）
+    if (inner[0] == ':' and inner[1] != ':') return false;
+
+    var groups: usize = 0; // 显式 hex 组数
     var double_colon_seen: bool = false;
     var prev_was_colon: bool = false;
     var chars_since_colon: usize = 0;
 
-    for (inner) |c| {
+    for (inner, 0..) |c, i| {
         if (c == ':') {
-            colons += 1;
             if (prev_was_colon) {
-                if (double_colon_seen) return false;
+                if (double_colon_seen) return false; // 第二个 "::" 或 ":::"
                 double_colon_seen = true;
             }
             prev_was_colon = true;
             chars_since_colon = 0;
         } else if ((c >= '0' and c <= '9') or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F')) {
+            if (i == 0 or prev_was_colon) groups += 1; // 新组开始
             prev_was_colon = false;
             chars_since_colon += 1;
             if (chars_since_colon > 4) return false;
@@ -211,13 +217,15 @@ pub fn isValidIpv6String(str: []const u8) bool {
         }
     }
 
+    // 尾部单冒号非法（"::" 结尾除外）
     if (prev_was_colon and !std.mem.endsWith(u8, inner, "::")) return false;
 
     if (double_colon_seen) {
-        return colons >= 2 and colons <= 7;
-    } else {
-        return colons == 7;
+        // "::" 至少压缩一个零组 → 显式组最多 7 个
+        // （按冒号计数会误拒 "1:2:3:4:5:6:7::" 等合法 8 冒号形式）
+        return groups <= 7;
     }
+    return groups == 8;
 }
 
 /// 验证域名（RFC 1123）。
@@ -281,6 +289,7 @@ pub const Cidr4 = struct {
     mask_bits: u8, // 0..32
 
     /// 解析 "a.b.c.d/n" CIDR 字符串。
+    /// 主机位会被清零归一化（"192.168.1.5/24" → network 192.168.1.0）。
     pub fn parse(s: []const u8) !Cidr4 {
         const slash = std.mem.indexOfScalar(u8, s, '/') orelse
             return error.InvalidCidr;
@@ -290,7 +299,8 @@ pub const Cidr4 = struct {
         if (bits > 32) return error.InvalidCidr;
 
         const ip_bytes = parseIpv4(ip_str) catch return error.InvalidCidr;
-        return .{ .network = ip4ToInt(&ip_bytes), .mask_bits = bits };
+        const mask: u32 = if (bits == 0) 0 else @as(u32, 0xFFFFFFFF) << @intCast(32 - bits);
+        return .{ .network = ip4ToInt(&ip_bytes) & mask, .mask_bits = bits };
     }
 
     /// 检查 IP（主机序 u32）是否在此 CIDR 范围内。
@@ -319,7 +329,10 @@ pub const Cidr4 = struct {
     }
 
     /// 返回广播地址（主机序 u32）。
+    /// /31 (RFC 3021) 和 /32 无广播地址，返回网络地址本身。
     pub fn broadcastAddr(self: Cidr4) u32 {
+        // /0 必须特判：32 - 0 = 32 无法 @intCast 到 u5（会 panic）
+        if (self.mask_bits == 0) return 0xFFFFFFFF;
         if (self.mask_bits >= 31) return self.network;
         const host_bits: u5 = @intCast(32 - self.mask_bits);
         const host_mask: u32 = (@as(u32, 1) << host_bits) - 1;
@@ -361,6 +374,7 @@ pub const Cidr6 = struct {
     mask_bits: u8, // 0..128
 
     /// 解析 "::/8"、"2000::/3"、"::1/128" 等 CIDR 字符串。
+    /// 主机位会被清零归一化（"2001:db8::1/64" → base 2001:db8::）。
     pub fn parse(s: []const u8) !Cidr6 {
         const slash_idx = std.mem.lastIndexOfScalar(u8, s, '/') orelse
             return error.InvalidCidr;
@@ -372,7 +386,21 @@ pub const Cidr6 = struct {
 
         const addr = std.Io.net.Ip6Address.parse(addr_str, 0) catch return error.InvalidCidr;
 
-        return .{ .base = addr.bytes, .mask_bits = bits };
+        // 清零主机位
+        var base = addr.bytes;
+        const full_bytes = bits / 8;
+        const rem_bits = bits % 8;
+        if (full_bytes < 16) {
+            if (rem_bits != 0) {
+                const mask: u8 = @as(u8, 0xff) << @intCast(8 - rem_bits);
+                base[full_bytes] &= mask;
+                for (base[full_bytes + 1 ..]) |*b| b.* = 0;
+            } else {
+                for (base[full_bytes..]) |*b| b.* = 0;
+            }
+        }
+
+        return .{ .base = base, .mask_bits = bits };
     }
 
     /// 检查 IP（[16]u8 网络字节序）是否在此 CIDR 范围内。
@@ -400,13 +428,14 @@ pub const Cidr6 = struct {
     }
 
     /// 返回此 CIDR 基址之后的下一个地址（128 位带进位递增）。
-    /// 调用者负责检查结果是否仍在 CIDR 范围内。
+    /// 全 FF 地址回绕为全 0。调用者负责检查结果是否仍在 CIDR 范围内。
     pub fn next(self: Cidr6) Ip6Addr {
         var result = self.base;
-        var i: usize = 15;
-        while (i > 0) : (i -= 1) {
+        var i: usize = 16;
+        while (i > 0) {
+            i -= 1;
             result[i] +%= 1;
-            if (result[i] != 0) break;
+            if (result[i] != 0) break; // 无进位则结束；byte[0] 也参与进位
         }
         return result;
     }
@@ -520,6 +549,20 @@ test "ip6ToInt / intToIp6: round-trip" {
     try testing.expectEqualSlices(u8, &bytes, &restored);
 }
 
+test "ip6ToInt: known conversions (big-endian semantics, regression)" {
+    // 回归：曾用 @bitCast 导致小端平台数值颠倒（::1 变成 1 << 120）
+    const loopback = [_]u8{0} ** 15 ++ [_]u8{1};
+    try testing.expectEqual(@as(u128, 1), ip6ToInt(&loopback));
+
+    const fe80_1 = [_]u8{ 0xfe, 0x80 } ++ [_]u8{0} ** 13 ++ [_]u8{1};
+    try testing.expectEqual(@as(u128, 0xfe80_0000_0000_0000_0000_0000_0000_0001), ip6ToInt(&fe80_1));
+
+    // 与 ip4ToInt 语义一致：byte[0] 在 MSB
+    const restored = intToIp6(1);
+    try testing.expectEqual(@as(u8, 1), restored[15]);
+    try testing.expectEqual(@as(u8, 0), restored[0]);
+}
+
 // ---- IP 解析测试 ----
 
 test "parseIpv4: valid addresses" {
@@ -601,6 +644,9 @@ test "isValidIpv6String: accepts compressed form" {
     try testing.expect(isValidIpv6String("[::]:1080"));
     try testing.expect(isValidIpv6String("::"));
     try testing.expect(isValidIpv6String("2001:db8::"));
+    // 8 冒号但合法的压缩形式（曾被按冒号计数误拒）
+    try testing.expect(isValidIpv6String("1:2:3:4:5:6:7::"));
+    try testing.expect(isValidIpv6String("::1:2:3:4:5:6:7"));
 }
 
 test "isValidIpv6String: rejects malformed" {
@@ -608,8 +654,12 @@ test "isValidIpv6String: rejects malformed" {
     try testing.expect(!isValidIpv6String("gggg:0:0:0:0:0:0:1"));
     try testing.expect(!isValidIpv6String("::1::"));
     try testing.expect(!isValidIpv6String(""));
-    try testing.expect(!isValidIpv6String("1:2:3:4:5:6:7")); // 6 个冒号
-    try testing.expect(!isValidIpv6String("1:2:3:4:5:6:7:8:9")); // 8 个冒号
+    try testing.expect(!isValidIpv6String("1:2:3:4:5:6:7")); // 7 组不足 8
+    try testing.expect(!isValidIpv6String("1:2:3:4:5:6:7:8:9")); // 9 组超出
+    try testing.expect(!isValidIpv6String(":1:2:3:4:5:6:7")); // 前导单冒号（曾被误收）
+    try testing.expect(!isValidIpv6String("1:2:3:4:5:6:7:8:")); // 尾部单冒号
+    try testing.expect(!isValidIpv6String("1:2:3:4:5:6:7:8::")); // 8 显式组 + "::" 共 9 组
+    try testing.expect(!isValidIpv6String("12345::1")); // 组超 4 位
 }
 
 test "isValidDomain: accepts valid domains" {
@@ -714,6 +764,21 @@ test "Cidr4.broadcast: /31 and /32 edge cases" {
     try testing.expectEqual(ip4ToInt(&[_]u8{ 192, 168, 1, 1 }), c32.broadcastAddr());
 }
 
+test "Cidr4.broadcast: /0 does not panic (regression)" {
+    // 回归：/0 时 32 - 0 = 32 曾被 @intCast 到 u5 触发 panic
+    const c0 = try Cidr4.parse("0.0.0.0/0");
+    try testing.expectEqual(@as(u32, 0xFFFFFFFF), c0.broadcastAddr());
+    const bc = c0.broadcastBytes();
+    try testing.expectEqualSlices(u8, &[_]u8{ 255, 255, 255, 255 }, &bc);
+}
+
+test "Cidr4.parse: normalizes host bits" {
+    const cidr = try Cidr4.parse("192.168.1.5/24");
+    try testing.expectEqual(@as(u32, 0xC0A80100), cidr.network);
+    var buf: [max_addr_buf]u8 = undefined;
+    try testing.expectEqualStrings("192.168.1.0/24", try cidr.format(&buf));
+}
+
 // ---- Cidr6 测试 ----
 
 test "Cidr6.parse: ::/8" {
@@ -778,6 +843,38 @@ test "Cidr6.next: increments correctly" {
 
     // next() should still be within ::/8
     try testing.expect(cidr.contains(next_addr));
+}
+
+test "Cidr6.next: carry propagates through byte 0 (regression)" {
+    // 回归：循环条件 while (i > 0) : (i -= 1) 曾跳过 byte[0]，进位丢失
+    const c1 = Cidr6{ .base = [_]u8{0} ** 15 ++ [_]u8{0xff}, .mask_bits = 0 };
+    const n1 = c1.next();
+    try testing.expectEqual(@as(u8, 0), n1[15]);
+    try testing.expectEqual(@as(u8, 1), n1[14]);
+
+    // 00ff:ffff:...:ffff + 1 → 0100:0000:...:0000（进位穿越 byte[1] 抵达 byte[0]）
+    const c2 = Cidr6{ .base = [_]u8{0x00} ++ [_]u8{0xff} ** 15, .mask_bits = 0 };
+    const n2 = c2.next();
+    try testing.expectEqual(@as(u8, 0x01), n2[0]);
+    for (n2[1..]) |b| try testing.expectEqual(@as(u8, 0), b);
+
+    // 全 FF 回绕为全 0
+    const c3 = Cidr6{ .base = [_]u8{0xff} ** 16, .mask_bits = 0 };
+    const n3 = c3.next();
+    for (n3) |b| try testing.expectEqual(@as(u8, 0), b);
+}
+
+test "Cidr6.parse: normalizes host bits" {
+    const cidr = try Cidr6.parse("2001:db8::1/64");
+    try testing.expectEqual(@as(u8, 0x20), cidr.base[0]);
+    try testing.expectEqual(@as(u8, 0x01), cidr.base[1]);
+    for (cidr.base[8..]) |b| try testing.expectEqual(@as(u8, 0), b);
+
+    // 非字节对齐前缀：fe80::1/10 → fe80:: 之外 base[1] 高 2 位保留
+    const c10 = try Cidr6.parse("febf::1/10");
+    try testing.expectEqual(@as(u8, 0xfe), c10.base[0]);
+    try testing.expectEqual(@as(u8, 0x80), c10.base[1]); // 0xbf & 0xc0 = 0x80
+    for (c10.base[2..]) |b| try testing.expectEqual(@as(u8, 0), b);
 }
 
 // ---- Host/Port 测试 ----

@@ -130,6 +130,10 @@ pub fn RingBuf(comptime T: type) type {
 
 const testing = std.testing;
 
+test "ring: reference all pub decls (lazy-analysis guard)" {
+    testing.refAllDecls(@This());
+}
+
 test "ring: basic push/pop" {
     var buf: [4]u32 = undefined;
     var rb = RingBuf(u32).init(&buf);
