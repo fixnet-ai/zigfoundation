@@ -6,12 +6,26 @@
 //! 跨线程数据交换，不走内核网络栈。基于 `RingBuf` + `xev.Async` 纯内存实现，
 //! 完全融入 libxev 事件循环。
 //!
+//! ## 核心约束：Completion 生命周期
+//!
+//! **Completion 必须存活到回调触发之后。** 内核（kqueue/epoll/IOCP）的 kevent
+//! `udata` 存储的是 `*xev.Completion` 指针，如果在回调触发前 Completion 内存被释放，
+//! 会导致 use-after-free。
+//!
+//! **生产代码的正确模式**（参照 zigproxy）：
+//! - Completion 嵌入堆分配的连接结构体，生命周期覆盖整个连接
+//! - **单个** xev.Loop 实例，由事件循环线程独占执行 loop.run()
+//! - 跨线程通信仅用 notify()（线程安全），无需多个 Loop
+//!
+//! 本模块测试中使用双 Loop 是因为测试用栈变量做 Completion 且线程提前退出——
+//! 这是测试的权宜之计，不是设计模式。不要在生产代码中模仿。
+//!
 //! ## 架构
 //!
 //! ```
 //! SharedState(buf_size)           — 堆分配，引用计数管理
 //!   ├─ RingBuf(u8) ×2             — 每方向一个无锁环形缓冲 (SPSC)
-//!   ├─ xev.Async ×2               — 每端点一个跨线程通知器
+//!   ├─ xev.Async ×4               — 每端点独立的读/写通知器
 //!   └─ atomic(bool)               — 关闭标志
 //!
 //! MemConn                         — 轻量句柄（指针语义，无所有权）
@@ -19,18 +33,36 @@
 //!   └─ 可选 refcounted 清理       — createPair / Registry 用
 //! ```
 //!
-//! ## 两种使用方式
+//! ## 使用方式（生产代码示例）
 //!
-//! 1. **直接使用 createPair** — 创建堆分配的连接对，不用注册表：
+//! 1. **createPair — 单 Loop，堆分配 Completion**：
 //!    ```zig
-//!    var pair = try memconn.createPair(4096, &loop, &loop, allocator);
-//!    defer pair.destroy();
-//!    var c: xev.Completion = .{};
-//!    pair.local.write(&loop, &c, "hello", void, null, writeCb);
-//!    try loop.run(.until_done);
+//!    const ConnCtx = struct {
+//!        conn: memconn.MemConn,
+//!        read_c: xev.Completion,   // Completion 嵌入连接结构体（堆分配）
+//!        write_c: xev.Completion,
+//!        buf: [4096]u8,
+//!    };
+//!
+//!    var ctx = try allocator.create(ConnCtx);
+//!    ctx.conn = pair.local;
+//!    // 注册读/写（Completion 存活到回调或 deinit）
+//!    ctx.conn.read(loop, &ctx.read_c, &ctx.buf, ConnCtx, ctx, readCb);
+//!    // 循环在单独线程运行 loop.run(.until_done)
 //!    ```
 //!
-//! 2. **命名连接** — 通过 Registry 按名称发现：
+//! 2. **跨线程通知**（无需第二个 Loop）：
+//!    ```zig
+//!    // 线程 A：事件循环线程
+//!    ctx.conn.read(loop, &ctx.read_c, &ctx.buf, ConnCtx, ctx, readCb);
+//!    loop.run(.until_done);  // 阻塞，等待回调
+//!
+//!    // 线程 B：业务线程，写入数据触发对端回调
+//!    peer_conn.write(loop, &ctx.write_c, data, ConnCtx, ctx, writeCb);
+//!    // write 内部调用 peer_read_async.notify() 唤醒线程 A 的 loop
+//!    ```
+//!
+//! 3. **命名连接** — 通过 Registry 按名称发现：
 //!    ```zig
 //!    var reg = try memconn.Registry.init(allocator);
 //!    defer reg.deinit();
@@ -46,6 +78,8 @@
 //! - close() 可从任意线程安全调用
 //! - Registry 由 Mutex 保护，线程安全
 //! - 不同操作必须使用不同的 Completion（read/write/close 各用各的）
+//! - xev.Async.notify() 线程安全：可在任意线程调用以唤醒事件循环
+//! - COMPLETION 生命周期约束：必须存活到回调触发之后（堆分配，勿栈分配跨线程）
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -1208,9 +1242,21 @@ test "createPair: zero-length write" {
 }
 
 // ---- 跨线程 ----
-// 跨线程测试使用两个独立的 Loop（每个线程一个），确保 Completion 生命周期正确。
-// 单 Loop 的跨线程模式不安全：spawned thread 的 Completion 是栈变量，
-// 线程退出后栈释放，但 kernel kevent 仍持有指向该 Completion 的指针。
+//
+// **重要：这些测试使用双 Loop 模式的原因。**
+//
+// 测试中 Completion 是**栈变量**，线程退出后栈被回收，但 kernel kevent 的
+// udata 仍持有指向已释放 Completion 的指针 → use-after-free。
+//
+// 双 Loop 保证注册 Completion 的线程也运行 loop.run()（阻塞），因此
+// Completion 在回调触发前一直存活。
+//
+// **这不是 memconn 的设计要求，而是栈 Completion + 跨线程的测试模式产物。**
+//
+// 生产代码的正确模式（参照 zigproxy）：
+// - Completion 嵌入堆分配的连接结构体，生命周期覆盖整个连接
+// - 单 Loop 实例，事件循环线程独占运行 loop.run()
+// - 跨线程通信仅用 xev.Async.notify()（线程安全），无需多个 Loop
 
 test "createPair: cross-thread write/read" {
     const Ctx = struct {

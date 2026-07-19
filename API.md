@@ -679,7 +679,17 @@ pub const Registry = struct {
 
 #### 使用方式
 
-**1. createPair — 堆分配连接对（同 loop 场景）**
+> **核心约束**: `xev.Completion` 在回调触发前必须保持存活。内核（kqueue/epoll/IOCP）的 kevent
+> `udata` 存储 `*xev.Completion` 指针，提前释放导致 use-after-free。
+>
+> **生产代码的正确模式**（参照 zigproxy）：Completion 嵌入堆分配的连接结构体，
+> 生命周期覆盖整个连接；**单 Loop** 实例，事件循环线程独占 `loop.run()`；
+> 跨线程通信仅用 `notify()`（线程安全），无需多个 Loop。
+>
+> 以下示例中 Completion 是栈变量（仅用于演示，因为 `loop.run(.until_done)` 阻塞
+> 保证了生命周期）。生产代码中请将 Completion 放入堆分配的 context 结构体。
+
+**1. createPair — 单 Loop，同线程注册**
 
 ```zig
 var loop = try xev.Loop.init(.{});
@@ -711,27 +721,28 @@ pair.local.read(&loop, &rc, &read_buf, void, null, (struct {
 try loop.run(.until_done);
 ```
 
-**2. 跨线程 — 两个独立 loop**
+**2. 生产代码推荐模式 — 单 Loop + 堆分配 Completion**
 
 ```zig
-var loop_a = try xev.Loop.init(.{});
-defer loop_a.deinit();
-var loop_b = try xev.Loop.init(.{});
-defer loop_b.deinit();
+// Completion 嵌入堆分配的连接上下文，生命周期覆盖整个连接
+const ConnCtx = struct {
+    conn: memconn.MemConn,
+    read_c: xev.Completion,
+    write_c: xev.Completion,
+    close_c: xev.Completion,
+    buf: [4096]u8,
+};
 
-var pair = try createPair(4096, &loop_a, &loop_b, allocator);
-defer pair.destroy();
+var ctx = try allocator.create(ConnCtx);
+ctx.* = .{ .conn = pair.local, ... };
 
-// 线程 B：在 loop_b 上注册读
-const ctx = Ctx{ .loop = &loop_b, .remote = &pair.remote };
-const t = try std.Thread.spawn(.{}, runReader, .{&ctx});
+// 事件循环线程注册读写（Completion 随 ctx 存活）
+ctx.conn.read(loop, &ctx.read_c, &ctx.buf, ConnCtx, ctx, readCb);
+ctx.conn.write(loop, &ctx.write_c, data, ConnCtx, ctx, writeCb);
+loop.run(.until_done);
 
-// 线程 A：在 loop_a 上写
-var wc: xev.Completion = .{};
-pair.local.write(&loop_a, &wc, "hello", void, null, writeCb);
-try loop_a.run(.until_done);
-
-t.join();
+// 其他线程写入对端，conn.write() 内部调用 peer_read_async.notify()
+// 唤醒事件循环线程 — 无需第二个 Loop
 ```
 
 **3. 命名连接 — 通过 Registry**
