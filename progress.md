@@ -1,6 +1,23 @@
 # Progress Log
 
-### Phase 8 async rewrite: memconn Completion 模型重写 (2026-07-19)
+### Phase 9: Windows 交叉编译修复 (2026-07-19)
+
+- **Status:** complete
+- 三组跨平台类型问题（全局修复，不逐行修补）：
+  1. **pthread 类型 = `void` on Windows** — `event.zig:48-49` PosixResetEvent.mutex/cond: `= .{}` → `= undefined`（`init()` 显式初始化）
+  2. **`std.c.nanosleep` = `void` on Windows** — `platform.zig` 新增 `sleepNs()`，4 处调用点统一替换
+  3. **zli `remaining` 字段移除 (Zig 0.16.0)** — `parseArgs()` 预收集参数到 ArrayList，索引迭代替代 `remaining` 访问 + `argsIterator.next()` 内部调用→索引前进
+- 编译成果：Windows aarch64-gnu PE32+ 4.0MB + Linux aarch64-musl + iOS aarch64-simulator + Android aarch64 全部成功
+- 回归：`zig build test` 219/219 ✅ + `zig fmt --check` ✅ + CLI 示例 13/13 ✅
+
+### 五平台交叉编译验证 (最终)
+| 平台 | 构建 | 备注 |
+|------|------|------|
+| macOS aarch64 (host) | ✅ + 219/219 ✅ | CLI 13/13 ✅ |
+| Linux aarch64-musl | ✅ | ELF 静态链接 |
+| iOS aarch64-simulator | ✅ | Mach-O arm64 |
+| Android aarch64 | ✅ | ELF 动态链接 |
+| Windows aarch64-gnu | ✅ | PE32+ AArch64 4.0MB |
 
 - **Status:** complete
 - 从 pthread 同步阻塞模型重写为 libxev Completion 异步模型
@@ -463,11 +480,20 @@
 ## 5-Question Reboot Check
 | Question | Answer |
 |----------|--------|
-| 我在哪里？ | Phase 6f 完成 — iOS 模拟器 simctl spawn 测试 13/13 全绿，五平台真机/模拟器运行验证全部闭环 |
-| 我要去哪里？ | 后续：兄弟项目适配 Zig 0.16.0 后的集成验证（唯一遗留）；持续维护 |
-| 目标是什么？ | 实现 13 个工业级基础模块，100% 测试覆盖，五平台 — 已达成 |
-| 我学到了什么？ | 1) Zig 交叉链接 iOS exe/dylib 不自动在 sysroot 找 libSystem.tbd → `-L/usr/lib` 相对形式；2) iOS Debug 构建缺 `__dyld_get_image_header_containing_address` → ReleaseSmall；3) simctl spawn 直连终端是 iOS 自动化测试正解（同 Android adb shell 模式）；4) 静态库不链接所以链接类问题在 .a 阶段不暴露 |
-| 我做了什么？ | Phase 6f: 修复 iOS libSystem 链接 → simctl spawn 13/13 PASS → 日志问题闭环 + 文档/经验沉淀 |
+| 我在哪里？ | Phase 8 完成 — memconn.zig libxev Completion 模型重写，219 tests 全绿，全平台交叉编译验证（除 Windows 预先存在的 5 个错误） |
+| 我要去哪里？ | Phase 9: 修复 Windows 交叉编译（event/queue/store + zli 适配）；兄弟项目集成验证 |
+| 目标是什么？ | 实现 14 个工业级基础模块（含 memconn），100% 测试覆盖，五平台 — memconn 已达成 |
+| 我学到了什么？ | 1) Completion 必须堆分配或与 loop.run() 同生命周期（kevent udata 存指针）；2) zigproxy 单 Loop + 堆 Completion 是生产正解，双 Loop 仅是测试 workaround；3) xev.Async.notify() 线程安全，跨线程不需要多 Loop；4) `addRunArtifact` 的 `--listen=-` 协议与 libxev 事件循环冲突导致 hang；5) Windows 交叉编译测试二进制有 5 个预先存在的错误（event/queue/store 的 pthread/nanosleep/zli），CLI 示例因跳过这些模块编译成功 |
+| 我做了什么？ | memconn async 重写、219 tests、全平台构建验证、Completion 生命周期澄清注释 |
+
+### 全平台交叉编译验证 (2026-07-19)
+| 平台 | 构建 | 测试 | 备注 |
+|------|------|------|------|
+| macOS aarch64 (host) | ✅ | 219/219 ✅ + CLI 13/13 ✅ | - |
+| Linux aarch64-musl | ✅ | — (需 VM) | ELF 静态链接 |
+| iOS aarch64-simulator | ✅ | — (需 simctl) | Mach-O arm64 |
+| Android aarch64 | ✅ | — (需 adb) | ELF 动态链接，linker64 |
+| Windows aarch64-gnu | ❌ 5 errors | — | 预先存在：event/queue/store + zli（非 memconn） |
 
 ---
 *每个阶段完成或遇到错误后更新此文件*

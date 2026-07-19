@@ -604,6 +604,7 @@ pub const MemListener = struct {
     _queue_tail: usize = 0,
     _queue_count: usize = 0,
     _closed: std.atomic.Value(bool) = .init(false),
+    _deinited: bool = false,
 
     fn init(listen_name: []const u8, allocator: std.mem.Allocator) !MemListener {
         return MemListener{
@@ -614,6 +615,9 @@ pub const MemListener = struct {
     }
 
     fn deinit(self: *MemListener) void {
+        if (self._deinited) return;
+        self._deinited = true;
+
         // 清理 accept 队列中未取走的连接
         while (self._queue_count > 0) {
             self._queue_buf[self._queue_head].closed.store(true, .release);

@@ -24,6 +24,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const event_mod = @import("event.zig");
+const platform = @import("platform.zig");
 
 /// 跨平台互斥锁 — POSIX 使用 pthread_mutex_t，Windows 使用原子自旋锁。
 const Mutex = if (builtin.os.tag == .windows)
@@ -246,7 +247,7 @@ test "queue: cross-thread push/tryPop" {
     var ctx = Ctx{ .q = &q };
     const Worker = struct {
         fn run(c: *Ctx) void {
-            _ = std.c.nanosleep(&.{ .sec = 0, .nsec = 50 * std.time.ns_per_ms }, null);
+            platform.sleepNs(50 * std.time.ns_per_ms);
             c.q.push(77);
         }
     };

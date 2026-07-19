@@ -195,3 +195,77 @@ ring 非环绕算术(32位理论溢出)；endian 泛型短输入 panic 无 check
 ---
 *每 2 次查看/浏览器/搜索操作后更新此文件*
 *防止视觉信息丢失*
+
+## Phase 8 — memconn.zig Completion 模型重写 (2026-07-19)
+
+### Completion 生命周期约束（关键发现）
+
+**核心事实**: 内核（kqueue/epoll/IOCP）的 kevent `udata` 存储的是 `*xev.Completion` 指针。
+Completion 在回调触发前释放 = use-after-free。
+
+**zigproxy 生产模式**（`src/server.zig`）:
+- Completion 嵌入堆分配的 Session 结构体（5 个字段：client_c/connect_c/client_close_c 等）
+- 单 Loop 实例，事件循环线程独占 loop.run()
+- `xev.Async` 完全不用，跨线程通信用原子自旋锁
+
+**测试中发现的问题**:
+- 栈 Completion + spawn 线程提前退出 → 野指针
+- 单 Loop 跨线程：线程 B 栈 Completion → 线程退出 → kevent udata 失效 → 线程 A 的 loop 处理 kevent 时崩溃
+- 双 Loop 是 workaround（注册线程=运行线程→栈存活），不是设计模式
+
+**正确姿势**:
+- Completion 必须堆分配（嵌入连接上下文结构体）
+- 单 Loop + notify() 跨线程通知（线程安全）
+- 生命周期：Context 创建→Completions 嵌入→read/write 注册→loop.run()→回调→Context 销毁
+
+### macOS kqueue + xev.Async 内部机制
+
+**`xev.Async` Mach port**（`libxev/src/watcher/async.zig`）:
+- `mpl_qlimit = 1`（Mach port 队列深度 1）
+- `wait()`: 设置 Completion → `loop.add(c)` → 实际 kevent 注册在 `tick()` 中
+- `drain()`: 在回调 wrapper 中调用，用 `MACH_RCV_MSG | MACH_RCV_TIMEOUT, MACH_MSG_TIMEOUT_NONE` 消费所有 pending 消息
+- `notify()`: 发送空 Mach 消息 `MACH_SEND_MSG` + `MACH_SEND_TIMEOUT` + `COPY_SEND` 标志
+
+**kqueue tick 循环**（`libxev/src/backend/kqueue.zig`）:
+- `ev.udata = @intFromPtr(self)` → `*Completion`
+- `c.perform()` → `c.callback()` → `.disarm`（EV_DELETE）或 `.rearm`（保持活跃）
+
+### `zig build test` hang 问题
+
+**原因**: `b.addRunArtifact(lib_tests)` 使用 `--listen=-` 模式（二进制协议 stdin/stdout）。
+该协议与 libxev 事件循环 / 跨线程测试冲突 → 测试二进制 hang → 构建系统收不到响应。
+
+**修复**: 改用 `b.addSystemCommand` 直接运行已安装的二进制（terminal 模式），避开了协议冲突。
+
+### 双向传输死锁
+
+**原始设计**: 每端点 2 个 Async（读/写共享一个通知器）。
+
+**问题**: 写通知唤醒的是同一 Async 上的读等待 → 读回调处理完数据后通知对端写 → 如果两端同时写满 buffer，
+都在等待对端读走数据，但通知被自己的读消费掉了 → 死锁。
+
+**修复**: 4 个 Async（每端点独立的读/写通知器）。写 notify → 对端读 Async 被唤醒；读 notify → 对端写 Async 被唤醒。读写不互相干扰。
+
+### 幂等 close + Registry refcount
+
+**问题**: 两个不同 MemConn（conn 和 accepted_conn）共享同一 `closed` 标志。第一个 close() 在 CloseOp 回调中释放 refcount，第二个 close() 命中幂等路径直接返回 → refcount 未释放 → 内存泄漏。
+
+**修复**: 幂等路径中，若 `_close_releases = true`（Registry 模式），也调用 `shared_release` 释放引用。
+
+### Windows 交叉编译修复 — 已解决 (2026-07-19)
+
+**问题**: `aarch64-windows-gnu` 测试二进制 5 个编译错误，全部预先存在（与 memconn 无关）。
+
+**全局分析**（不逐行修补）:
+
+| 类别 | 错误原因 | 修复策略 | 影响文件 |
+|------|---------|---------|---------|
+| pthread 类型 = `void` | Windows 无 pthread, `std.c.pthread_mutex_t`/`pthread_cond_t` 是 `void`, `= .{}` 对 void 无效 | `= undefined`（`init()` 显式初始化，安全） | event.zig:48-49 |
+| `std.c.nanosleep` = `void` | Windows 无 POSIX nanosleep | `platform.zig` 新增 `sleepNs()` — Windows: `kernel32 Sleep(ms)`, POSIX: `nanosleep` | event.zig:313, queue.zig:249, store.zig:357,373 |
+| `Args.Iterator.Windows.remaining` 已移除 | Zig 0.16.0 Windows Args Iterator 不再有 `remaining` 字段 | zli `parseArgs()` 预收集所有参数到 ArrayList, 索引迭代替代 `remaining` 访问 | zli.zig:843,869,916,971 |
+
+**关键发现**:
+- Zig 0.16.0 `std.ArrayList` 是 unmanaged 类型（旧 `ArrayListUnmanaged`），API 变为 `.empty` + 方法传 `allocator`。zli 已适配此模式，仅新加的预收集代码用了旧 API。
+- `comptime-known if`（`builtin.os.tag == .windows`）能正确剪枝 POSIX 代码，但 `_ =` 抛弃检查发生在剪枝前。不加 `_ =` 直接 `return false;` 即可。
+
+验证: `zig build test-build -Dtarget=aarch64-windows-gnu` → PE32+ AArch64 4.0MB ✅

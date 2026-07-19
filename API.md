@@ -668,125 +668,277 @@ pub const Registry = struct {
 };
 ```
 
-#### MemConn API
+#### 获取连接的三种方式
+
+| 方式 | 函数 | 场景 |
+|------|------|------|
+| 直接创建 | `createPair(buf_size, loop_a, loop_b, allocator)` | 同一初始化路径中直接拿到 local + remote |
+| 命名注册 | `Registry.listen/dial` | 跨模块，按名称解耦发现；dial 同步返回，accept 异步获取 |
+| 全局便捷 | `initGlobal/listen/dial` | 全局单例，免去传递 Registry 实例 |
+
+#### 核心 API
 
 | 方法 | 签名 | 描述 |
 |------|------|------|
+| `createPair` | `fn (comptime buf_size: usize, loop_a, loop_b, allocator) !PairHandle` | 创建一对已连接的 MemConn |
 | `read` | `fn (self, loop, c, buf, Userdata, userdata, cb) void` | 异步读 — rx_ring 有数据或对端关闭时回调（返回 0 = EOF） |
 | `write` | `fn (self, loop, c, buf, Userdata, userdata, cb) void` | 异步写 — 尽力写入全部数据，中间满时自动 re-arm 等待 |
-| `close` | `fn (self, loop, c, Userdata, userdata, cb) void` | 异步关闭 — 设置关闭标志，通知对端，幂等 |
-| `isClosed` | `fn (self) bool` | 检查是否已关闭 |
+| `close` | `fn (self, loop, c, Userdata, userdata, cb) void` | 异步关闭 — 设置关闭标志，通知对端。幂等（可安全多次调用） |
+| `isClosed` | `fn (self) bool` | 非阻塞检查关闭状态 |
 
-#### 使用方式
+---
 
-> **核心约束**: `xev.Completion` 在回调触发前必须保持存活。内核（kqueue/epoll/IOCP）的 kevent
-> `udata` 存储 `*xev.Completion` 指针，提前释放导致 use-after-free。
->
-> **生产代码的正确模式**（参照 zigproxy）：Completion 嵌入堆分配的连接结构体，
-> 生命周期覆盖整个连接；**单 Loop** 实例，事件循环线程独占 `loop.run()`；
-> 跨线程通信仅用 `notify()`（线程安全），无需多个 Loop。
->
-> 以下示例中 Completion 是栈变量（仅用于演示，因为 `loop.run(.until_done)` 阻塞
-> 保证了生命周期）。生产代码中请将 Completion 放入堆分配的 context 结构体。
+#### 使用模式
 
-**1. createPair — 单 Loop，同线程注册**
+##### 模式 1：createPair — 最基本读写
 
 ```zig
 var loop = try xev.Loop.init(.{});
 defer loop.deinit();
 
-var pair = try foundation.memconn.createPair(4096, &loop, &loop, allocator);
+var pair = try memconn.createPair(256, &loop, &loop, allocator);
 defer pair.destroy();
 
-// 在远程端写
+var write_done = false;
+var read_buf: [64]u8 = undefined;
+var read_n: usize = 0;
+
+// 一端写
 var wc: xev.Completion = .{};
-pair.remote.write(&loop, &wc, "hello", void, null, (struct {
-    fn cb(_: ?*void, _: *xev.Loop, _: *xev.Completion, b: []const u8, r: error{Closed}!usize) xev.CallbackAction {
+pair.local.write(&loop, &wc, "hello", bool, &write_done, (struct {
+    fn cb(ud: ?*bool, l: *xev.Loop, c: *xev.Completion, b: []const u8, r: error{Closed}!usize) xev.CallbackAction {
+        _ = l; _ = c; _ = b;
+        ud.?.* = true;
         _ = r catch unreachable;
         return .disarm;
     }
 }).cb);
 
-// 在本地端读
-var read_buf: [64]u8 = undefined;
+// 另一端读
 var rc: xev.Completion = .{};
-pair.local.read(&loop, &rc, &read_buf, void, null, (struct {
-    fn cb(_: ?*void, _: *xev.Loop, _: *xev.Completion, b: []u8, r: error{Closed}!usize) xev.CallbackAction {
-        const n = r catch unreachable;
-        // 使用 b[0..n] ...
+pair.remote.read(&loop, &rc, &read_buf, usize, &read_n, (struct {
+    fn cb(ud: ?*usize, l: *xev.Loop, c: *xev.Completion, b: []u8, r: error{Closed}!usize) xev.CallbackAction {
+        _ = l; _ = c; _ = b;
+        ud.?.* = r catch unreachable;
         return .disarm;
     }
 }).cb);
 
 try loop.run(.until_done);
+// write_done == true, read_n == 5, read_buf[0..5] == "hello"
 ```
 
-**2. 生产代码推荐模式 — 单 Loop + 堆分配 Completion**
+##### 模式 2：双向同时通信
+
+`pair.local` 和 `pair.remote` 完全对称，可同时在两个方向收发：
 
 ```zig
-// Completion 嵌入堆分配的连接上下文，生命周期覆盖整个连接
-const ConnCtx = struct {
+// 两个方向同时写
+pair.local.write(&loop, &wc1, "ping", void, null, writeCb);
+pair.remote.write(&loop, &wc2, "pong", void, null, writeCb);
+
+// 两个方向同时读
+pair.remote.read(&loop, &rc1, &remote_buf, usize, &remote_n, readCb1);
+pair.local.read(&loop, &rc2, &local_buf, usize, &local_n, readCb2);
+
+try loop.run(.until_done);
+// remote_buf == "ping", local_buf == "pong"
+```
+
+##### 模式 3：关闭与 EOF 检测
+
+```zig
+// 一端关闭
+var cc: xev.Completion = .{};
+pair.local.close(&loop, &cc, void, null, (struct {
+    fn cb(_: ?*void, _: *xev.Loop, _: *xev.Completion, _: void) xev.CallbackAction {
+        return .disarm;
+    }
+}).cb);
+
+// 对端 read 返回 0（EOF）
+var read_n: isize = -1;
+var rc: xev.Completion = .{};
+pair.remote.read(&loop, &rc, &read_buf, isize, &read_n, (struct {
+    fn cb(ud: ?*isize, l: *xev.Loop, c: *xev.Completion, b: []u8, r: error{Closed}!usize) xev.CallbackAction {
+        _ = l; _ = c; _ = b;
+        ud.?.* = @intCast(r catch unreachable);  // 0 = EOF
+        return .disarm;
+    }
+}).cb);
+
+try loop.run(.until_done);
+// read_n == 0 且 pair.remote.isClosed() == true
+```
+
+**close() 是幂等的** — 多次调用安全，第二次及以后调用立即同步回调，不会重复注册 Completion。
+
+##### 模式 4：生产代码 — 堆分配 Completion + re-arm 持续读
+
+这是 zigproxy 等生产项目的推荐模式。Completion 嵌入堆分配的连接结构体，生命周期覆盖整个连接。在读回调中 re-arm 同一个 Completion 实现持续监听：
+
+```zig
+const Connection = struct {
     conn: memconn.MemConn,
-    read_c: xev.Completion,
-    write_c: xev.Completion,
-    close_c: xev.Completion,
-    buf: [4096]u8,
+    read_c: xev.Completion = .{},   // Completion 嵌入结构体（堆分配）
+    buf: [4096]u8 = undefined,
+    total: usize = 0,
+
+    fn start(self: *Connection, loop: *xev.Loop) void {
+        self.conn.read(loop, &self.read_c, &self.buf, Connection, self, onData);
+    }
+
+    fn onData(ud: ?*Connection, loop: *xev.Loop, c: *xev.Completion,
+              buf: []u8, r: error{Closed}!usize) xev.CallbackAction {
+        const self = ud.?;
+        const n = r catch return .disarm;
+        if (n == 0) return .disarm;  // EOF
+
+        // 处理 buf[0..n] ...
+
+        // re-arm：继续读（复用同一个 Completion c）
+        self.conn.read(loop, c, &self.buf, Connection, self, onData);
+        return .disarm;
+    }
 };
 
-var ctx = try allocator.create(ConnCtx);
-ctx.* = .{ .conn = pair.local, ... };
+// 使用
+var ctx = try allocator.create(Connection);
+ctx.conn = pair.remote;
+ctx.start(loop);
 
-// 事件循环线程注册读写（Completion 随 ctx 存活）
-ctx.conn.read(loop, &ctx.read_c, &ctx.buf, ConnCtx, ctx, readCb);
-ctx.conn.write(loop, &ctx.write_c, data, ConnCtx, ctx, writeCb);
-loop.run(.until_done);
-
-// 其他线程写入对端，conn.write() 内部调用 peer_read_async.notify()
-// 唤醒事件循环线程 — 无需第二个 Loop
+// 对端多次写
+pair.local.write(&loop, &wc1, "ab", ...);
+pair.local.write(&loop, &wc2, "cd", ...);
+try loop.run(.until_done);
+// ctx.total == 4
 ```
 
-**3. 命名连接 — 通过 Registry**
+##### 模式 5：Registry — 命名连接跨模块解耦
 
 ```zig
-var reg = try foundation.memconn.Registry.init(allocator);
+var reg = try memconn.Registry.init(allocator);
 defer reg.deinit();
 
-// 服务端
-const listener = try reg.listen("mypipe");
+// === 服务端 ===
+var listener = try reg.listen("tun.device0");
 defer { listener.close(); listener.deinit(); }
 
-// 客户端（不同线程，同步 dial + 异步 I/O）
-var conn = try reg.dial(4096, "mypipe");
-var wc: xev.Completion = .{};
-conn.write(&loop, &wc, "hello", void, null, writeCb);
-
-// 服务端异步 accept
+// 异步 accept
+var accepted: ?memconn.MemConn = null;
 var ac: xev.Completion = .{};
-listener.accept(&loop, &ac, void, null, (struct {
-    fn cb(_: ?*void, _: *xev.Loop, _: *xev.Completion, conn: ?MemConn) xev.CallbackAction {
-        if (conn) |c| {
-            // 用 c 进行 read/write ...
-        }
+listener.accept(&loop, &ac, ?memconn.MemConn, &accepted, (struct {
+    fn cb(ud: ?*?memconn.MemConn, l: *xev.Loop, c: *xev.Completion, conn: ?memconn.MemConn) xev.CallbackAction {
+        _ = l; _ = c;
+        ud.?.* = conn;  // conn == null 表示 listener 已关闭
         return .disarm;
     }
 }).cb);
+
+// === 客户端（不同线程/模块）===
+var conn = try reg.dial(4096, "tun.device0");  // 同步，立即返回
+conn.write(&loop, &wc, "hello", ...);
+
+// 服务端 accept 回调触发，拿到 conn
+try loop.run(.until_done);
+// accepted != null，可进行 read/write
+
+// 重要：Registry 模式下两端都必须 close() 以释放 SharedState 引用计数
+var c1: xev.Completion = .{};
+conn.close(&loop, &c1, void, null, closeCb);
+var c2: xev.Completion = .{};
+accepted.?.close(&loop, &c2, void, null, closeCb);
 try loop.run(.until_done);
 ```
+
+##### 模式 6：跨线程通信
+
+跨线程通知通过 `xev.Async.notify()`（线程安全）实现，无需多个事件循环：
+
+```zig
+// 线程 A — 事件循环线程（注册读，阻塞在 loop.run()）
+const t = try std.Thread.spawn(.{}, (struct {
+    fn run(c: *Ctx) void {
+        var rc: xev.Completion = .{};
+        c.remote.read(c.loop, &rc, &c.read_buf, Ctx, c, onData);
+        c.loop.run(.until_done) catch {};
+    }
+}).run, .{&ctx});
+
+// 线程 B — 写数据（内部调用 peer_read_async.notify() 唤醒线程 A）
+var wc: xev.Completion = .{};
+pair.local.write(&loop_a, &wc, "ping", void, null, writeCb);
+try loop_a.run(.until_done);
+
+t.join();
+// ctx.read_buf == "ping"
+```
+
+**原理**：write() 将数据推入 `tx_ring`（lock-free SPSC），然后 `peer_read_async.notify()` 跨线程唤醒对端事件循环。全程仅原子操作 + 环形缓冲区，零系统调用（notify 除外）。
+
+> **注意**：以上跨线程示例使用双 Loop 是因为测试中 Completion 是栈变量且线程会提前退出。
+> 生产代码中推荐**单 Loop** + 堆分配 Completion，仅用 `notify()` 跨线程唤醒。
+
+---
+
+#### 回调签名速查
+
+所有回调必须返回 `xev.CallbackAction`（`.disarm` 或 `.rearm`），且必须通过**内联 struct 的 `.cb` 字段**传入（comptime 约束，不可传函数变量）：
+
+| 操作 | 回调签名 | `r` 含义 |
+|------|---------|----------|
+| `read` | `fn (?*Userdata, *xev.Loop, *xev.Completion, []u8, error{Closed}!usize) xev.CallbackAction` | `0` = EOF（对端关闭），`>0` = 读到的字节数 |
+| `write` | `fn (?*Userdata, *xev.Loop, *xev.Completion, []const u8, error{Closed}!usize) xev.CallbackAction` | 实际写入字节数；调用者应确保一次回调中完全写入 |
+| `close` | `fn (?*Userdata, *xev.Loop, *xev.Completion, void) xev.CallbackAction` | 无错误传递 |
+| `accept` | `fn (?*Userdata, *xev.Loop, *xev.Completion, ?MemConn) xev.CallbackAction` | `null` = listener 已关闭 |
+
+---
+
+#### 注意事项
+
+1. **回调必须是 comptime 函数**：`read/write/close/accept` 的 `cb` 参数是 `comptime` 的。不能传函数指针变量，必须用内联 struct 模式：
+
+   ```zig
+   // ❌ 错误：函数指针变量不是 comptime 已知的
+   const myCb = someStruct.someFn;
+   conn.read(&loop, &c, &buf, void, null, myCb);
+
+   // ✅ 正确：内联 struct 的 .cb 字段是 comptime 已知的
+   conn.read(&loop, &c, &buf, void, null, (struct {
+       fn cb(ud: ?*void, l: *xev.Loop, c: *xev.Completion, b: []u8, r: error{Closed}!usize) xev.CallbackAction {
+           _ = l; _ = c; _ = b;
+           // 处理数据...
+           return .disarm;
+       }
+   }).cb);
+   ```
+
+2. **Completion 必须存活到回调触发后**：内核（kqueue/epoll/IOCP）的 kevent `udata` 存储的是 `*xev.Completion` 指针。如果在回调触发前 Completion 被释放，导致 **use-after-free**。解决方案：
+   - 生产代码：Completion 嵌入堆分配的结构体，生命周期覆盖整个连接
+   - 测试代码：栈 Completion + `loop.run(.until_done)` 阻塞保证生命周期
+   - 绝不：栈 Completion 跨线程（线程返回后栈被回收，kevent 仍持有悬垂指针）
+
+3. **不同操作使用不同 Completion**：`read`、`write`、`close` 各需要独立的 `xev.Completion`。不可复用同一个 Completion 同时注册多个操作。
+
+4. **`buf_size` 必须是 2 的幂**：编译期 `@compileError` 校验。`RingBuf` 使用位掩码取模，非 2 的幂会导致数据损坏。
+
+5. **SPSC 契约**：每方向 RingBuf 是单生产者单消费者。同一端点的 `write`（或 `read`）不能从多线程并发调用。需要多生产者场景应在上层加队列或锁。
+
+6. **Registry 模式下 close() 释放引用计数**：`Registry.dial()` 创建的连接，SharedState 引用计数由 `close()` 回调管理。两端都 close 后 SharedState 自动释放。反之，`createPair` 创建的连接由 `PairHandle.destroy()` 统一释放，close 不释放引用计数。
+
+7. **`createPair` 的 `loop_a` / `loop_b` 参数**：目前仅为 API 预留（标记两端各自归属的事件循环），实际存储不依赖这两个参数。Async 的 init/notify/wait 不绑定特定 Loop 实例。可传同一个 Loop 两次。
+
+8. **大消息自动分片**：当写入数据超过 RingBuf 可用空间时，write 先写入部分，剩余的通过回调中 `re-arm` 等待对端消费后继续。调用者无需处理部分写入——回调返回的 `written` 一定等于 `buf.len`（除非对端关闭）。
 
 #### 线程安全模型
 
 | 操作 | 安全约束 |
 |------|---------|
 | `read()` (端点A) + `write()` (端点B) | ✅ 并发安全（SPSC 每方向） |
-| 两线程同时 `write()` 同一端点 | ❌ UB（SPSC 契约） |
+| 两线程同时 `write()` 同一端点 | ❌ UB（破坏 SPSC 契约） |
 | 两线程同时 `read()` 同一端点 | ❌ UB |
-| `close()` 任意线程 | ✅ 安全（原子 + Async 通知） |
-| `Registry.listen()` / `dial()` | ✅ 互斥保护 |
-| 同一 MemConn 不同操作需不同 Completion | ✅ read/write/close 各用各的 |
-
-#### buf_size 要求
-
-`buf_size` 必须是 2 的幂（编译期 `@compileError` 校验）。`RingBuf` 利用位掩码进行模运算，非 2 的幂会导致错误。
+| `close()` 任意线程 | ✅ 安全（原子标志 + Async 通知） |
+| `Registry.listen()` / `dial()` / `unlisten()` | ✅ Mutex 保护 |
 
 ---
 
@@ -1059,6 +1211,7 @@ adb shell /data/local/tmp/zigfoundation-android-test
 
 | 版本 | 日期 | 变更 |
 |------|------|------|
+| 0.1.4 | 2026-07-19 | memconn API 文档重写：6 种使用模式 + 回调签名速查 + 8 条注意事项（comptime 回调约束、Completion 生命周期、SPSC 契约、引用计数管理等） |
 | 0.1.3 | 2026-07-19 | Phase 8 async rewrite: memconn.zig 从同步阻塞重写为 libxev Completion 模型（SharedState 含 4 个 xev.Async、双 loop 跨线程、219 tests 全绿） |
 | 0.1.2 | 2026-07-19 | Phase 8: memconn.zig 内存网络连接模块（MemPipe/MemConn/PairHandle/MemListener/Registry），37 tests，233 total tests 全绿，zero memory leaks |
 | 0.1.1 | 2026-07-19 | P0-P3 bug 修复 26 项（event/cli/platform/egress/strings/log/store），196 tests，三平台交叉编译 + iOS/Android 模拟器真机验证通过，移动端开发环境文档 |

@@ -147,6 +147,26 @@ pub fn getRecommendedPoolSize() usize {
 }
 
 // ============================================================
+// 跨平台睡眠
+// ============================================================
+
+/// 跨平台纳秒级睡眠。Windows 使用 kernel32 Sleep (毫秒精度)，其他平台使用 nanosleep。
+pub fn sleepNs(ns: u64) void {
+    if (native_os == .windows) {
+        const ms = ns / std.time.ns_per_ms;
+        if (ms == 0) return;
+        const Win32 = struct {
+            extern "kernel32" fn Sleep(dwMilliseconds: u32) callconv(.winapi) void;
+        };
+        Win32.Sleep(@intCast(@min(ms, std.math.maxInt(u32))));
+    } else {
+        const s: u64 = ns / std.time.ns_per_s;
+        const remainder: u64 = ns % std.time.ns_per_s;
+        _ = c.nanosleep(&.{ .sec = @intCast(s), .nsec = @intCast(remainder) }, null);
+    }
+}
+
+// ============================================================
 // 系统 DNS 探测
 // ============================================================
 

@@ -21,6 +21,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const endian = @import("endian.zig");
+const platform = @import("platform.zig");
 
 /// 文件头部大小：8 字节到期时间戳
 const HEADER_SIZE: usize = 8;
@@ -354,7 +355,7 @@ test "store: expiry — get returns null after TTL" {
     try s.set("ephemeral", "data", 1);
     // 注意 nsec 必须 < 1e9：曾写 1200ms 的纯 nsec (1.2e9) 触发 EINVAL 零睡眠，
     // 使本测试从未真正等到过期。1.3s > TTL 1s，秒级时间戳下必然过期。
-    _ = std.c.nanosleep(&.{ .sec = 1, .nsec = 300 * std.time.ns_per_ms }, null);
+    platform.sleepNs(1 * std.time.ns_per_s + 300 * std.time.ns_per_ms);
     const result = try s.get("ephemeral");
     defer if (result) |r| testing.allocator.free(r);
     try testing.expect(result == null); // 曾缺失此核心断言
@@ -370,7 +371,7 @@ test "store: cleanExpired removes expired entries" {
     try s.set("expire_soon", "data", 1);
     try s.set("permanent", "forever", 0);
 
-    _ = std.c.nanosleep(&.{ .sec = 1, .nsec = 300 * std.time.ns_per_ms }, null);
+    platform.sleepNs(1 * std.time.ns_per_s + 300 * std.time.ns_per_ms);
 
     const cleaned = try s.cleanExpired();
     try testing.expectEqual(@as(usize, 1), cleaned); // 曾写 `_ = cleaned` 无断言

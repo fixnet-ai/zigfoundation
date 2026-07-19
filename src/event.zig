@@ -45,8 +45,10 @@ pub const ResetEvent = switch (builtin.os.tag) {
 /// 手动重置事件：`set()` 粘性保持直到 `reset()`。
 pub const PosixResetEvent = struct {
     state: std.atomic.Value(u32) = .init(0),
-    mutex: std.c.pthread_mutex_t = .{},
-    cond: std.c.pthread_cond_t = .{},
+    /// 初始化为 undefined 而非 .{}，因为 Windows 上 pthread_mutex_t 是 void
+    /// （.{} 对 void 无效）。init() 通过 pthread_mutex_init 显式初始化，安全。
+    mutex: std.c.pthread_mutex_t = undefined,
+    cond: std.c.pthread_cond_t = undefined,
 
     /// 初始化 mutex 和 condvar。
     ///
@@ -117,6 +119,13 @@ pub const PosixResetEvent = struct {
     /// 包含虚假唤醒重试循环：pthread_cond_timedwait 可能无原因返回，
     /// 重试直到状态变更或 deadline 过期。
     pub fn timedWait(self: *PosixResetEvent, timeout_ms: u32) bool {
+        // comptime-known 条件：Windows 上 std.c.timespec 是 void，
+        // 此分支编译时被剪枝，下方 POSIX 代码不会被语义分析。
+        // PosixResetEvent 只在非 Windows 平台通过 ResetEvent 分派使用。
+        if (builtin.os.tag == .windows) {
+            return false;
+        }
+
         if (self.state.load(.acquire) != 0) return true;
         if (timeout_ms == 0) return false;
         _ = std.c.pthread_mutex_lock(&self.mutex);
@@ -310,7 +319,7 @@ test "event: ResetEvent cross-thread notify" {
 
     const Worker = struct {
         fn run(c: *Ctx) void {
-            _ = std.c.nanosleep(&.{ .sec = 0, .nsec = 50 * std.time.ns_per_ms }, null);
+            platform.sleepNs(50 * std.time.ns_per_ms);
             c.ev.set();
         }
     };

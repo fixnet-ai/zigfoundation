@@ -4,7 +4,7 @@
 从 zigproxy/zproxy/zigtun 提取公共组件，实现 13 个工业级基础模块（buffer/ring/endian/platform/net/strings/cli/log/yaml/store/event/queue/egress），100% 单元测试覆盖，五平台支持。
 
 ## Current Phase
-Phase 8 async rewrite — memconn.zig Completion 模型重写（已完成）
+Phase 9: Windows 交叉编译修复 — 完成。所有五平台测试二进制编译成功。
 
 ## Phases
 
@@ -149,6 +149,25 @@ Phase 8 async rewrite — memconn.zig Completion 模型重写（已完成）
 - [x] P2 示例假 PASS 类：H13 硬编码 PASS→真实测试 / H14 catch-as-pass ×3→false / H15 testLog .warn→.info / H16 JNI store 路径→绝对路径 (android + ios)
 - [x] P3 MEDIUM: event timedWait 虚假唤醒重试 + set/setFromSignal 广播竞态 / strings splitTrim 缺\n / log log_level+.debug+prefix OOM UB / store doc sync 修正
 - [x] 回归验证：zig build test 196/196 全绿 + zig fmt OK + 三平台交叉编译 + CLI 示例 13/13
+- **Status:** complete
+
+### Phase 9: Windows 交叉编译修复 (complete)
+
+**根本原因分析**：三组跨平台类型问题，不是局部 bug：
+
+1. **pthread 类型 = `void` on Windows** → 默认值 `= .{}` 失败（`void` 不支持 struct 初始化语法）。`event.zig:48-49` 的 `PosixResetEvent.mutex/cond` 改为 `= undefined`（`init()` 显式初始化，安全）。
+
+2. **`std.c.nanosleep` = `void` on Windows** → `event.zig:313`、`queue.zig:249`、`store.zig:357,373` 共 4 处睡眠调用。全局方案：在 `platform.zig` 添加跨平台 `sleepNs(ns: u64)` — Windows 用 `kernel32 Sleep(ms)`，POSIX 用 `nanosleep`。
+
+3. **`Args.Iterator.Windows.remaining` 已移除 (Zig 0.16.0)** → `zli.zig:843,869,916,971` 共 4 处引用。全局方案：在 `parseArgs()` 中预收集所有参数到 `ArrayList`，以索引迭代替代 `remaining` 访问；`argsIterator.next()` 内部调用点改为索引前进。
+
+- [x] `platform.zig` — 新增 `sleepNs()` 跨平台睡眠函数
+- [x] `event.zig` — PosixResetEvent 字段 `= undefined` + timedWait comptime 守卫
+- [x] `queue.zig` — 导入 platform + `std.c.nanosleep` → `platform.sleepNs`
+- [x] `store.zig` — 导入 platform + 2 处 `std.c.nanosleep` → `platform.sleepNs`
+- [x] `zli.zig` — parseArgs 预收集参数替代 `remaining` 字段（兼容 Zig 0.16.0 Windows Iterator）
+- [x] `zig build test-build -Dtarget=aarch64-windows-gnu` — 编译成功（PE32+ AArch64 4.0MB）
+- [x] 回归：`zig build test` 219/219 ✅ + `zig fmt --check` ✅ + CLI 示例 13/13 ✅
 - **Status:** complete
 
 ### Phase 8 async rewrite: memconn.zig — libxev Completion 模型重写（std + libxev）
