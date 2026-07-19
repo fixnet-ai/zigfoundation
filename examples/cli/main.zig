@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const foundation = @import("foundation");
+const xev = @import("xev");
 
 // 通过 log.zig 统一日志输出
 pub const std_options: std.Options = foundation.log.logOptions();
@@ -34,6 +35,7 @@ pub fn main() u8 {
 
     testBuffer();
     testRing();
+    testRingZeroCopy();
     testEndian();
     testPlatform();
     testNet();
@@ -45,6 +47,7 @@ pub fn main() u8 {
     testEvent();
     testQueue();
     testEgress();
+    testMemconnDirect();
 
     std.debug.print("\n---\n{d} passed, {d} failed\n\n", .{ passed, failed });
     return if (failed > 0) @as(u8, 1) else @as(u8, 0);
@@ -430,4 +433,81 @@ fn testEgress() void {
     defer sock2.close();
 
     check("egress", ok1 and sock2.getFd() != foundation.egress.INVALID_SOCKET);
+}
+
+// ============================================================================
+// ring.zig — 零拷贝 span API
+// ============================================================================
+fn testRingZeroCopy() void {
+    var storage: [8]u8 = undefined;
+    var rb = foundation.ring.RingBuf(u8).init(&storage);
+
+    // writeSpan + commitWrite — 零拷贝写入
+    const span = rb.writeSpan(5);
+    @memcpy(span[0..5], "hello");
+    rb.commitWrite(5);
+
+    // readSpan + commitRead — 零拷贝读取
+    const rspan = rb.readSpan();
+    const ok = rspan.len == 5 and std.mem.eql(u8, rspan[0..5], "hello");
+    rb.commitRead(5);
+
+    check("ring-zero-copy", ok and rb.isEmpty());
+}
+
+// ============================================================================
+// memconn.zig — 零拷贝 readDirect / writeDirect
+// ============================================================================
+fn testMemconnDirect() void {
+    var loop = xev.Loop.init(.{}) catch {
+        check("memconn-direct", false);
+        return;
+    };
+    defer loop.deinit();
+
+    var pair = foundation.memconn.createPair(256, &loop, &loop, allocator) catch {
+        check("memconn-direct", false);
+        return;
+    };
+    defer pair.destroy();
+
+    const DirectCtx = struct {
+        write_done: bool = false,
+        read_data: [5]u8 = .{0} ** 5,
+        read_n: usize = 0,
+    };
+    var ctx = DirectCtx{};
+
+    // writeDirect — 回调直接拿到 RingBuf 可写切片（零拷贝写）
+    var wc: xev.Completion = .{};
+    pair.local.writeDirect(&loop, &wc, 5, DirectCtx, &ctx, (struct {
+        fn cb(ud: ?*DirectCtx, l: *xev.Loop, c: *xev.Completion, span: []u8, r: error{Closed}!usize) xev.CallbackAction {
+            _ = l;
+            _ = c;
+            _ = r catch unreachable;
+            @memcpy(span[0..5], "hello");
+            ud.?.*.write_done = true;
+            return .disarm;
+        }
+    }).cb);
+
+    // readDirect — 回调直接收到 RingBuf 内部数据切片（零拷贝读）
+    var rc: xev.Completion = .{};
+    pair.remote.readDirect(&loop, &rc, DirectCtx, &ctx, (struct {
+        fn cb(ud: ?*DirectCtx, l: *xev.Loop, c: *xev.Completion, data: []const u8, r: error{Closed}!usize) xev.CallbackAction {
+            _ = l;
+            _ = c;
+            const n = r catch unreachable;
+            @memcpy(ud.?.*.read_data[0..data.len], data);
+            ud.?.*.read_n = n;
+            return .disarm;
+        }
+    }).cb);
+
+    loop.run(.until_done) catch {
+        check("memconn-direct", false);
+        return;
+    };
+
+    check("memconn-direct", ctx.write_done and ctx.read_n == 5 and std.mem.eql(u8, &ctx.read_data, "hello"));
 }

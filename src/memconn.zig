@@ -355,6 +355,99 @@ pub const MemConn = struct {
     pub fn isClosed(self: *const MemConn) bool {
         return self.closed.load(.acquire);
     }
+
+    // ---- 零拷贝接口 ----
+
+    /// 注册零拷贝异步读操作。
+    ///
+    /// 回调接收的 `[]const u8` 直接指向底层 RingBuf 内存——无 @memcpy。
+    /// 切片仅在回调期间有效；回调返回后数据自动提交（推进 head）。
+    /// 返回 0 且 isClosed() == true 表示 EOF。
+    ///
+    /// 注意：受环形缓冲区绕回限制，一次性可读的数据可能少于全部数据。
+    /// 若需读取剩余数据，在回调中重新调用 readDirect() 即可。
+    ///
+    /// cb: fn (?*Userdata, *xev.Loop, *xev.Completion, []const u8, error{Closed}!usize) xev.CallbackAction
+    pub fn readDirect(
+        self: *const MemConn,
+        loop: *xev.Loop,
+        c: *xev.Completion,
+        comptime Userdata: type,
+        userdata: ?*Userdata,
+        comptime cb: *const fn (
+            ud: ?*Userdata,
+            l: *xev.Loop,
+            c_inner: *xev.Completion,
+            b: []const u8,
+            r: error{Closed}!usize,
+        ) xev.CallbackAction,
+    ) void {
+        const S = ReadDirectOp(Userdata, cb);
+        const op = self.allocator.create(S) catch {
+            _ = cb(userdata, loop, c, &.{}, 0);
+            return;
+        };
+        op.* = .{
+            .allocator = self.allocator,
+            .memconn = self.*,
+            .userdata = userdata,
+        };
+
+        if (!self.rx_ring.isEmpty() or self.closed.load(.acquire)) {
+            self.self_read_async.notify() catch {};
+        }
+
+        self.self_read_async.wait(loop, c, S, op, S.internalCb);
+    }
+
+    /// 注册零拷贝异步写操作。
+    ///
+    /// 写入 `n` 字节。回调接收直接指向 tx_ring 的 `[]u8` 可写切片
+    /// （长度等于 n），调用者将数据写入切片后返回。切片仅在回调期间有效；
+    /// 回调返回后自动提交（推进 tail）并通知对端。
+    ///
+    /// 若 RingBuf 空间不足，自动等待（re-arm）直到对端消费后空间释放。
+    ///
+    /// cb: fn (?*Userdata, *xev.Loop, *xev.Completion, []u8, error{Closed}!usize) xev.CallbackAction
+    pub fn writeDirect(
+        self: *const MemConn,
+        loop: *xev.Loop,
+        c: *xev.Completion,
+        n: usize,
+        comptime Userdata: type,
+        userdata: ?*Userdata,
+        comptime cb: *const fn (
+            ud: ?*Userdata,
+            l: *xev.Loop,
+            c_inner: *xev.Completion,
+            b: []u8,
+            r: error{Closed}!usize,
+        ) xev.CallbackAction,
+    ) void {
+        if (n == 0) {
+            _ = cb(userdata, loop, c, &.{}, @as(usize, 0));
+            return;
+        }
+        if (self.closed.load(.acquire)) {
+            _ = cb(userdata, loop, c, &.{}, error.Closed);
+            return;
+        }
+
+        const S = WriteDirectOp(Userdata, cb);
+        const op = self.allocator.create(S) catch {
+            _ = cb(userdata, loop, c, &.{}, error.Closed);
+            return;
+        };
+        op.* = .{
+            .allocator = self.allocator,
+            .memconn = self.*,
+            .n = n,
+            .userdata = userdata,
+        };
+
+        self.self_write_async.notify() catch {};
+        self.self_write_async.wait(loop, c, S, op, S.internalCb);
+    }
 };
 
 // ============================================================================
@@ -480,6 +573,85 @@ fn CloseOp(comptime Userdata: type, comptime cb: anytype) type {
                 }
             }
 
+            return action;
+        }
+    };
+}
+
+// ---- 零拷贝操作状态 ----
+
+fn ReadDirectOp(comptime Userdata: type, comptime cb: anytype) type {
+    return struct {
+        const Self = @This();
+
+        allocator: std.mem.Allocator,
+        memconn: MemConn,
+        userdata: ?*Userdata,
+
+        fn internalCb(
+            ud: ?*Self,
+            loop: *xev.Loop,
+            c: *xev.Completion,
+            r: xev.Async.WaitError!void,
+        ) xev.CallbackAction {
+            const self = ud.?;
+            _ = r catch {};
+
+            if (self.memconn.closed.load(.acquire) and self.memconn.rx_ring.isEmpty()) {
+                const action = cb(self.userdata, loop, c, &.{}, @as(usize, 0));
+                self.allocator.destroy(self);
+                return action;
+            }
+
+            const span = self.memconn.rx_ring.readSpan();
+            if (span.len > 0) {
+                const action = cb(self.userdata, loop, c, span, span.len);
+                self.memconn.rx_ring.commitRead(span.len);
+                self.memconn.peer_write_async.notify() catch {};
+                self.allocator.destroy(self);
+                return action;
+            }
+
+            return .rearm;
+        }
+    };
+}
+
+fn WriteDirectOp(comptime Userdata: type, comptime cb: anytype) type {
+    return struct {
+        const Self = @This();
+
+        allocator: std.mem.Allocator,
+        memconn: MemConn,
+        n: usize,
+        userdata: ?*Userdata,
+
+        fn internalCb(
+            ud: ?*Self,
+            loop: *xev.Loop,
+            c: *xev.Completion,
+            r: xev.Async.WaitError!void,
+        ) xev.CallbackAction {
+            const self = ud.?;
+            _ = r catch {};
+
+            if (self.memconn.closed.load(.acquire)) {
+                const action = cb(self.userdata, loop, c, &.{}, error.Closed);
+                self.allocator.destroy(self);
+                return action;
+            }
+
+            const span = self.memconn.tx_ring.writeSpan(self.n);
+            if (span.len < self.n) {
+                // 空间不足，等待对端消费
+                return .rearm;
+            }
+
+            const exact_span = span[0..self.n];
+            const action = cb(self.userdata, loop, c, exact_span, self.n);
+            self.memconn.tx_ring.commitWrite(self.n);
+            self.memconn.peer_read_async.notify() catch {};
+            self.allocator.destroy(self);
             return action;
         }
     };
@@ -1821,4 +1993,328 @@ test "Registry: cross-thread dial and accept" {
         }
     }).cb);
     try loop_b.run(.until_done);
+}
+
+// ---- 零拷贝接口测试 ----
+
+test "createPair: readDirect zero-copy" {
+    var loop = try xev.Loop.init(.{});
+    defer loop.deinit();
+
+    var pair = try createPair(256, &loop, &loop, testing.allocator);
+    defer pair.destroy();
+
+    var write_done = false;
+
+    const ReadCtx = struct {
+        data: [64]u8 = undefined,
+        n: usize = 0,
+    };
+    var read_ctx = ReadCtx{};
+
+    // 写入数据
+    var wc: xev.Completion = .{};
+    pair.local.write(&loop, &wc, "hello", bool, &write_done, (struct {
+        fn cb(ud: ?*bool, l: *xev.Loop, c: *xev.Completion, b: []const u8, r: error{Closed}!usize) xev.CallbackAction {
+            _ = l;
+            _ = c;
+            _ = b;
+            ud.?.* = true;
+            _ = r catch unreachable;
+            return .disarm;
+        }
+    }).cb);
+
+    // 零拷贝读取 — 回调中的 span 直接指向 RingBuf 内存
+    var rc: xev.Completion = .{};
+    pair.remote.readDirect(&loop, &rc, ReadCtx, &read_ctx, (struct {
+        fn cb(ud: ?*ReadCtx, l: *xev.Loop, c: *xev.Completion, b: []const u8, r: error{Closed}!usize) xev.CallbackAction {
+            _ = l;
+            _ = c;
+            const n = r catch unreachable;
+            // b 直接指向 RingBuf，零拷贝
+            @memcpy(ud.?.data[0..n], b[0..n]);
+            ud.?.n = n;
+            return .disarm;
+        }
+    }).cb);
+
+    try loop.run(.until_done);
+    try testing.expect(write_done);
+    try testing.expectEqual(@as(usize, 5), read_ctx.n);
+    try testing.expectEqualStrings("hello", read_ctx.data[0..read_ctx.n]);
+}
+
+test "createPair: writeDirect zero-copy" {
+    var loop = try xev.Loop.init(.{});
+    defer loop.deinit();
+
+    var pair = try createPair(256, &loop, &loop, testing.allocator);
+    defer pair.destroy();
+
+    var written = false;
+    var read_buf: [64]u8 = undefined;
+    var read_n: usize = 0;
+
+    // 零拷贝写入 — 回调中的 span 直接指向 tx_ring 内存
+    var wc: xev.Completion = .{};
+    pair.local.writeDirect(&loop, &wc, 5, bool, &written, (struct {
+        fn cb(ud: ?*bool, l: *xev.Loop, c: *xev.Completion, b: []u8, r: error{Closed}!usize) xev.CallbackAction {
+            _ = l;
+            _ = c;
+            _ = r catch unreachable;
+            // b 直接指向 tx_ring，零拷贝写入
+            b[0] = 'w';
+            b[1] = 'o';
+            b[2] = 'r';
+            b[3] = 'l';
+            b[4] = 'd';
+            ud.?.* = true;
+            return .disarm;
+        }
+    }).cb);
+
+    // 对端读取
+    var rc: xev.Completion = .{};
+    pair.remote.read(&loop, &rc, &read_buf, usize, &read_n, (struct {
+        fn cb(ud: ?*usize, l: *xev.Loop, c: *xev.Completion, b: []u8, r: error{Closed}!usize) xev.CallbackAction {
+            _ = l;
+            _ = c;
+            _ = b;
+            ud.?.* = r catch unreachable;
+            return .disarm;
+        }
+    }).cb);
+
+    try loop.run(.until_done);
+    try testing.expect(written);
+    try testing.expectEqualStrings("world", read_buf[0..read_n]);
+}
+
+test "createPair: readDirect returns 0 on peer close (EOF)" {
+    var loop = try xev.Loop.init(.{});
+    defer loop.deinit();
+
+    var pair = try createPair(256, &loop, &loop, testing.allocator);
+    defer pair.destroy();
+
+    var read_n: isize = -1;
+
+    // 关闭一端
+    var cc: xev.Completion = .{};
+    pair.local.close(&loop, &cc, void, null, (struct {
+        fn cb(_: ?*void, _: *xev.Loop, _: *xev.Completion, _: void) xev.CallbackAction {
+            return .disarm;
+        }
+    }).cb);
+
+    // 对端零拷贝读取 → EOF
+    var rc: xev.Completion = .{};
+    pair.remote.readDirect(&loop, &rc, isize, &read_n, (struct {
+        fn cb(ud: ?*isize, l: *xev.Loop, c: *xev.Completion, b: []const u8, r: error{Closed}!usize) xev.CallbackAction {
+            _ = l;
+            _ = c;
+            _ = b;
+            ud.?.* = @intCast(r catch unreachable);
+            return .disarm;
+        }
+    }).cb);
+
+    try loop.run(.until_done);
+    try testing.expectEqual(@as(isize, 0), read_n);
+}
+
+test "createPair: writeDirect returns error.Closed after close" {
+    var loop = try xev.Loop.init(.{});
+    defer loop.deinit();
+
+    var pair = try createPair(256, &loop, &loop, testing.allocator);
+    defer pair.destroy();
+
+    var write_closed = false;
+
+    // 先关闭对端
+    var cc: xev.Completion = .{};
+    pair.remote.close(&loop, &cc, void, null, (struct {
+        fn cb(_: ?*void, _: *xev.Loop, _: *xev.Completion, _: void) xev.CallbackAction {
+            return .disarm;
+        }
+    }).cb);
+
+    // 尝试零拷贝写入 → error.Closed
+    var wc: xev.Completion = .{};
+    pair.local.writeDirect(&loop, &wc, 10, bool, &write_closed, (struct {
+        fn cb(ud: ?*bool, l: *xev.Loop, c: *xev.Completion, b: []u8, r: error{Closed}!usize) xev.CallbackAction {
+            _ = l;
+            _ = c;
+            _ = b;
+            _ = r catch {
+                ud.?.* = true;
+                return .disarm;
+            };
+            return .disarm;
+        }
+    }).cb);
+
+    try loop.run(.until_done);
+    try testing.expect(write_closed);
+}
+
+test "createPair: readDirect bidirectional zero-copy" {
+    var loop = try xev.Loop.init(.{});
+    defer loop.deinit();
+
+    var pair = try createPair(256, &loop, &loop, testing.allocator);
+    defer pair.destroy();
+
+    const ReadCtx = struct {
+        data: [64]u8 = undefined,
+        n: usize = 0,
+    };
+    var local_ctx = ReadCtx{};
+    var remote_ctx = ReadCtx{};
+
+    // 写入 "ping" 用普通 write
+    var wc1: xev.Completion = .{};
+    pair.local.write(&loop, &wc1, "ping", void, null, (struct {
+        fn cb(_: ?*void, _: *xev.Loop, _: *xev.Completion, _: []const u8, r: error{Closed}!usize) xev.CallbackAction {
+            _ = r catch unreachable;
+            return .disarm;
+        }
+    }).cb);
+
+    // 写入 "pong" 用零拷贝 writeDirect
+    var wc2: xev.Completion = .{};
+    pair.remote.writeDirect(&loop, &wc2, 4, void, null, (struct {
+        fn cb(_: ?*void, l: *xev.Loop, c: *xev.Completion, b: []u8, r: error{Closed}!usize) xev.CallbackAction {
+            _ = l;
+            _ = c;
+            _ = r catch unreachable;
+            b[0] = 'p';
+            b[1] = 'o';
+            b[2] = 'n';
+            b[3] = 'g';
+            return .disarm;
+        }
+    }).cb);
+
+    // 零拷贝读取 remote 方向
+    var rc1: xev.Completion = .{};
+    pair.remote.readDirect(&loop, &rc1, ReadCtx, &remote_ctx, (struct {
+        fn cb(ud: ?*ReadCtx, l: *xev.Loop, c: *xev.Completion, b: []const u8, r: error{Closed}!usize) xev.CallbackAction {
+            _ = l;
+            _ = c;
+            const n = r catch unreachable;
+            @memcpy(ud.?.data[0..n], b[0..n]);
+            ud.?.n = n;
+            return .disarm;
+        }
+    }).cb);
+
+    // 零拷贝读取 local 方向
+    var rc2: xev.Completion = .{};
+    pair.local.readDirect(&loop, &rc2, ReadCtx, &local_ctx, (struct {
+        fn cb(ud: ?*ReadCtx, l: *xev.Loop, c: *xev.Completion, b: []const u8, r: error{Closed}!usize) xev.CallbackAction {
+            _ = l;
+            _ = c;
+            const n = r catch unreachable;
+            @memcpy(ud.?.data[0..n], b[0..n]);
+            ud.?.n = n;
+            return .disarm;
+        }
+    }).cb);
+
+    try loop.run(.until_done);
+    try testing.expectEqualStrings("ping", remote_ctx.data[0..remote_ctx.n]);
+    try testing.expectEqualStrings("pong", local_ctx.data[0..local_ctx.n]);
+}
+
+test "createPair: readDirect large data" {
+    var loop = try xev.Loop.init(.{});
+    defer loop.deinit();
+
+    var pair = try createPair(4096, &loop, &loop, testing.allocator);
+    defer pair.destroy();
+
+    const msg = [_]u8{'B'} ** 4000;
+    var write_done = false;
+
+    const ReadCtx = struct {
+        buf: [4000]u8 = undefined,
+        total: usize = 0,
+    };
+    var read_ctx = ReadCtx{};
+
+    var wc: xev.Completion = .{};
+    pair.local.write(&loop, &wc, &msg, bool, &write_done, (struct {
+        fn cb(ud: ?*bool, l: *xev.Loop, c: *xev.Completion, b: []const u8, r: error{Closed}!usize) xev.CallbackAction {
+            _ = l;
+            _ = c;
+            _ = b;
+            ud.?.* = true;
+            _ = r catch unreachable;
+            return .disarm;
+        }
+    }).cb);
+
+    // 零拷贝读取 — 缓冲区 4096 足够容纳 4000 字节，无绕回，一次读取完成
+    var rc: xev.Completion = .{};
+    pair.remote.readDirect(&loop, &rc, ReadCtx, &read_ctx, (struct {
+        fn cb(ud: ?*ReadCtx, l: *xev.Loop, c: *xev.Completion, b: []const u8, r: error{Closed}!usize) xev.CallbackAction {
+            _ = l;
+            _ = c;
+            const n = r catch unreachable;
+            @memcpy(ud.?.buf[0..n], b[0..n]);
+            ud.?.total = n;
+            return .disarm;
+        }
+    }).cb);
+
+    try loop.run(.until_done);
+    try testing.expect(write_done);
+    try testing.expectEqual(@as(usize, 4000), read_ctx.total);
+    try testing.expectEqualSlices(u8, &msg, read_ctx.buf[0..read_ctx.total]);
+}
+
+test "createPair: writeDirect full buffer rearm" {
+    var loop = try xev.Loop.init(.{});
+    defer loop.deinit();
+
+    // 小缓冲区：仅 4 字节，强制绕回/满等待
+    var pair = try createPair(4, &loop, &loop, testing.allocator);
+    defer pair.destroy();
+
+    var written = false;
+    var read_buf: [8]u8 = undefined;
+    var read_n: usize = 0;
+
+    // 零拷贝写入 4 字节（填满缓冲区）
+    var wc: xev.Completion = .{};
+    pair.local.writeDirect(&loop, &wc, 4, bool, &written, (struct {
+        fn cb(ud: ?*bool, l: *xev.Loop, c: *xev.Completion, b: []u8, r: error{Closed}!usize) xev.CallbackAction {
+            _ = l;
+            _ = c;
+            _ = r catch unreachable;
+            @memcpy(b[0..4], "abcd");
+            ud.?.* = true;
+            return .disarm;
+        }
+    }).cb);
+
+    // 对端读取
+    var rc: xev.Completion = .{};
+    pair.remote.read(&loop, &rc, &read_buf, usize, &read_n, (struct {
+        fn cb(ud: ?*usize, l: *xev.Loop, c: *xev.Completion, b: []u8, r: error{Closed}!usize) xev.CallbackAction {
+            _ = l;
+            _ = c;
+            _ = b;
+            ud.?.* = r catch unreachable;
+            return .disarm;
+        }
+    }).cb);
+
+    try loop.run(.until_done);
+    try testing.expect(written);
+    try testing.expectEqual(@as(usize, 4), read_n);
+    try testing.expectEqualStrings("abcd", read_buf[0..read_n]);
 }

@@ -78,6 +78,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     example_cli_mod.addImport("foundation", lib_module);
+    example_cli_mod.addImport("xev", libxev_dep.module("xev"));
 
     const example_cli = b.addExecutable(.{
         .name = "zigfoundation-example-cli",

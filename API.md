@@ -1,6 +1,6 @@
 # zigfoundation API 参考
 
-> **状态**: 14 模块全部实现，219 tests 全绿
+> **状态**: 14 模块全部实现，232 tests 全绿
 >
 > 版本: 0.1.0 | 目标平台: Windows / macOS / Linux / iOS / Android
 >
@@ -121,6 +121,25 @@ pub fn RingBuf(comptime T: type) type
 | `popSlice` | `fn (self: *Self, dest: []T) usize` | 批量读取，返回实际读取数 |
 | `tryPush` | `fn (self: *Self, item: T) bool` | 尝试写入，满时返回 false |
 | `tryPop` | `fn (self: *Self) ?T` | 尝试读取，空时返回 null |
+
+#### 性能优化 (v0.1.6)
+
+`pushSlice` / `popSlice` 使用 `@memcpy` 批量拷贝替代逐元素循环，LLVM 自动向量化
+（NEON / SSE / AVX）。环形缓冲区绕回时自动拆分为两次 `@memcpy`。
+
+#### 零拷贝 API (v0.1.6)
+
+直接操作内部缓冲区内存，消除中间拷贝：
+
+| 函数 | 签名 | 描述 |
+|------|------|------|
+| `writeSpan` | `fn (self: *Self, max_n: usize) []T` | 获取可写入的连续区间（受绕回边界限制） |
+| `commitWrite` | `fn (self: *Self, n: usize) void` | 提交写入 n 个元素，推进 tail |
+| `readSpan` | `fn (self: *const Self) []const T` | 获取可读取的连续区间（受绕回边界限制） |
+| `commitRead` | `fn (self: *Self, n: usize) void` | 提交读取 n 个元素，推进 head |
+
+**注意**：零拷贝区间受环形缓冲区绕回边界限制，`readSpan`/`writeSpan` 返回
+的长度可能少于实际可读写量。调用者需分两次调用处理绕回数据。
 
 ---
 
@@ -694,6 +713,8 @@ pub const Registry = struct {
 | `createPair` | `fn (comptime buf_size: usize, loop_a, loop_b, allocator) !PairHandle` | 创建一对已连接的 MemConn |
 | `read` | `fn (self, loop, c, buf, Userdata, userdata, cb) void` | 异步读 — rx_ring 有数据或对端关闭时回调（返回 0 = EOF） |
 | `write` | `fn (self, loop, c, buf, Userdata, userdata, cb) void` | 异步写 — 尽力写入全部数据，中间满时自动 re-arm 等待 |
+| `readDirect` | `fn (self, loop, c, Userdata, userdata, cb) void` | **零拷贝读** — 回调直接接收 RingBuf 内部切片，跳过中间拷贝 |
+| `writeDirect` | `fn (self, loop, c, n, Userdata, userdata, cb) void` | **零拷贝写** — 回调直接接收 RingBuf 可写切片，跳过中间拷贝 |
 | `close` | `fn (self, loop, c, Userdata, userdata, cb) void` | 异步关闭 — 设置关闭标志，通知对端。幂等（可安全多次调用） |
 | `isClosed` | `fn (self) bool` | 非阻塞检查关闭状态 |
 
@@ -890,6 +911,55 @@ t.join();
 > **注意**：以上跨线程示例使用双 Loop 是因为测试中 Completion 是栈变量且线程会提前退出。
 > 生产代码中推荐**单 Loop** + 堆分配 Completion，仅用 `notify()` 跨线程唤醒。
 
+##### 模式 7：零拷贝读写 (readDirect/writeDirect) (v0.1.6)
+
+`readDirect` 和 `writeDirect` 回调直接接收 RingBuf 内部缓冲区切片，
+消除 caller buf → RingBuf 和 RingBuf → caller buf 两次中间拷贝：
+
+```zig
+// === readDirect — 回调拿到 RingBuf 内部数据指针，无需预分配 buf ===
+var read_n: usize = 0;
+var rc: xev.Completion = .{};
+pair.remote.readDirect(&loop, &rc, usize, &read_n, (struct {
+    fn cb(ud: ?*usize, l: *xev.Loop, c: *xev.Completion,
+          data: []const u8, n: usize) xev.CallbackAction {
+        _ = l; _ = c;
+        ud.?.* = data.len;
+        // data 直接指向 RingBuf 内部内存，零拷贝
+        // 回调返回后 RingBuf 自动 commitRead(n)
+        return .disarm;
+    }
+}).cb);
+
+// 对端写入数据触发读回调
+var wc: xev.Completion = .{};
+pair.local.write(&loop, &wc, "hello", void, null, writeCb);
+try loop.run(.until_done);
+// read_n == 5，data 直接是 RingBuf 内存中的 "hello"
+
+// === writeDirect — 回调拿到 RingBuf 可写切片，直接写入 ===
+var wc2: xev.Completion = .{};
+pair.local.writeDirect(&loop, &wc2, 5, void, null, (struct {
+    fn cb(ud: ?*void, l: *xev.Loop, c: *xev.Completion,
+          span: []u8, n: usize) xev.CallbackAction {
+        _ = l; _ = c; _ = ud;
+        @memcpy(span[0..5], "world");
+        // 回调返回后 RingBuf 自动 commitWrite(n)
+        return .disarm;
+    }
+}).cb);
+```
+
+**零拷贝效果** — 以 fixnet 数据流 TUN → memconn A → Proxy → memconn B → Outbound 为例：
+- 原来：每次传输 4 次中间拷贝（pushSlice + popSlice × 2）
+- `readDirect` 消除读侧拷贝，降至 2 次中间拷贝
+- `writeDirect` 消除写侧拷贝，结合使用可降至 0 次中间拷贝
+
+**约束**：
+- `readDirect` 回调不应返回 `.rearm`（ReadDirectOp 在首次回调后销毁自身）
+- `writeDirect` 缓冲区满时自动 re-arm 等待对端消费
+- 零拷贝区间受环形缓冲区绕回边界限制，`readDirect` 回调收到的 `data.len` 可能少于实际可读数据
+
 ---
 
 #### 回调签名速查
@@ -900,6 +970,8 @@ t.join();
 |------|---------|----------|
 | `read` | `fn (?*Userdata, *xev.Loop, *xev.Completion, []u8, error{Closed}!usize) xev.CallbackAction` | `0` = EOF（对端关闭），`>0` = 读到的字节数 |
 | `write` | `fn (?*Userdata, *xev.Loop, *xev.Completion, []const u8, error{Closed}!usize) xev.CallbackAction` | 实际写入字节数；调用者应确保一次回调中完全写入 |
+| `readDirect` | `fn (?*Userdata, *xev.Loop, *xev.Completion, []const u8, usize) xev.CallbackAction` | `data` 直接指向 RingBuf 内部缓冲区，`n` = 数据长度（0 = EOF） |
+| `writeDirect` | `fn (?*Userdata, *xev.Loop, *xev.Completion, []u8, usize) xev.CallbackAction` | `span` = 可写切片（长度 = 请求的 n），`n` = 可用字节数 |
 | `close` | `fn (?*Userdata, *xev.Loop, *xev.Completion, void) xev.CallbackAction` | 无错误传递 |
 | `accept` | `fn (?*Userdata, *xev.Loop, *xev.Completion, ?MemConn) xev.CallbackAction` | `null` = listener 已关闭 |
 
@@ -1227,6 +1299,7 @@ adb shell /data/local/tmp/zigfoundation-android-test
 
 | 版本 | 日期 | 变更 |
 |------|------|------|
+| 0.1.6 | 2026-07-20 | 零拷贝优化：RingBuf pushSlice/popSlice 用 `@memcpy` 批量拷贝（LLVM 自动向量化）；RingBuf 新增零拷贝 span API (writeSpan/commitWrite/readSpan/commitRead)；memconn 新增零拷贝 Completion (readDirect/writeDirect) 消除中间内存拷贝 |
 | 0.1.5 | 2026-07-20 | log.zig 平台日志增强：Android 改用 `__android_log_write`(logcat)、iOS 改用 `syslog`；build.zig 新增 `android-test` 步骤；Android liblog 通过 `addObjectFile` 链接 |
 | 0.1.4 | 2026-07-19 | memconn API 文档重写：6 种使用模式 + 回调签名速查 + 8 条注意事项（comptime 回调约束、Completion 生命周期、SPSC 契约、引用计数管理等） |
 | 0.1.3 | 2026-07-19 | Phase 8 async rewrite: memconn.zig 从同步阻塞重写为 libxev Completion 模型（SharedState 含 4 个 xev.Async、双 loop 跨线程、219 tests 全绿） |
