@@ -21,6 +21,7 @@ pub fn build(b: *std.Build) void {
     const zli_module = zli_dep.module("zli");
 
     const yaml_dep = b.dependency("yaml", .{});
+    const libxev_dep = b.dependency("libxev", .{});
 
     // =======================================================================
     // 库模块 — zigfoundation 基础库
@@ -33,6 +34,7 @@ pub fn build(b: *std.Build) void {
     });
     lib_module.addImport("zli", zli_module);
     lib_module.addImport("yaml_c", yaml_dep.module("yaml_c"));
+    lib_module.addImport("xev", libxev_dep.module("xev"));
 
     // ---- 目标: 静态库 ----
     const lib = b.addLibrary(.{
@@ -50,13 +52,20 @@ pub fn build(b: *std.Build) void {
         .name = "zigfoundation-tests",
         .root_module = lib_module,
     });
-    const test_step = b.step("test", "运行所有单元测试");
-    test_step.dependOn(&b.addRunArtifact(lib_tests).step);
 
-    // test-build: 仅编译测试（不运行），用于交叉编译
+    // test-build: 编译测试并安装到 zig-out/bin/（用于交叉编译）
     const test_install = b.addInstallArtifact(lib_tests, .{});
     const test_build_step = b.step("test-build", "编译测试二进制 (不运行，用于交叉编译)");
     test_build_step.dependOn(&test_install.step);
+
+    // test: 直接运行已安装的测试二进制（terminal 模式，避免 --listen=- 模式
+    // 与 libxev 事件循环 / 跨线程测试的兼容性问题导致 hang）。
+    const test_run = b.addSystemCommand(&.{
+        b.pathJoin(&.{ b.install_path, "bin", "zigfoundation-tests" }),
+    });
+    test_run.step.dependOn(&test_install.step);
+    const test_step = b.step("test", "运行所有单元测试");
+    test_step.dependOn(&test_run.step);
 
     // =======================================================================
     // Phase 6: 示例程序 — 三个平台的集成测试

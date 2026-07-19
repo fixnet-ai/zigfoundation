@@ -4,7 +4,7 @@
 从 zigproxy/zproxy/zigtun 提取公共组件，实现 13 个工业级基础模块（buffer/ring/endian/platform/net/strings/cli/log/yaml/store/event/queue/egress），100% 单元测试覆盖，五平台支持。
 
 ## Current Phase
-Phase 7 (bug 修复 — 全库审查 62 项发现)
+Phase 8 async rewrite — memconn.zig Completion 模型重写（已完成）
 
 ## Phases
 
@@ -149,6 +149,21 @@ Phase 7 (bug 修复 — 全库审查 62 项发现)
 - [x] P2 示例假 PASS 类：H13 硬编码 PASS→真实测试 / H14 catch-as-pass ×3→false / H15 testLog .warn→.info / H16 JNI store 路径→绝对路径 (android + ios)
 - [x] P3 MEDIUM: event timedWait 虚假唤醒重试 + set/setFromSignal 广播竞态 / strings splitTrim 缺\n / log log_level+.debug+prefix OOM UB / store doc sync 修正
 - [x] 回归验证：zig build test 196/196 全绿 + zig fmt OK + 三平台交叉编译 + CLI 示例 13/13
+- **Status:** complete
+
+### Phase 8 async rewrite: memconn.zig — libxev Completion 模型重写（std + libxev）
+
+- [x] 设计：SharedState 含 4 个 xev.Async（每端点独立读/写通知）、Completion 回调 API
+- [x] 实现 MemConn.read/write/close — 全部 Completion 回调式，接受 loop + c + cb
+- [x] 实现 OpState 类型（ReadOp/WriteOp/CloseOp）— 堆分配，回调释放
+- [x] 实现 createPair/PairHandle — 支持两组 *xev.Loop（双 loop 跨线程模式）
+- [x] 实现 MemListener.accept — 异步 accept（xev.Async notify + accept 队列）
+- [x] 实现 Registry — 同步 listen/dial/unlisten（Mutex 保护）
+- [x] 实现全局便捷函数（initGlobal/deinitGlobal/listen/dial）
+- [x] 双 loop 跨线程模式：每线程独立 xev.Loop，Completion 栈变量与 loop 生命周期绑定
+- [x] 幂等 close + Registry refcount 释放：第二方 close 也在幂等路径释放引用
+- [x] build.zig test step: addSystemCommand 代替 addRunArtifact（避免 --listen=- 与 libxev 冲突）
+- [x] 219 tests 全绿 + zero memory leaks + zig fmt OK
 - **Status:** complete
 
 ## Key Questions

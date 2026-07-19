@@ -12,6 +12,9 @@
         .yaml = .{
             .path = "vendor/yaml",
         },
+        .libxev = .{
+            .path = "../libxev",
+        },
     },
 
     .paths = .{

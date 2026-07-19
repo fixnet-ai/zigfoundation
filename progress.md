@@ -1,5 +1,51 @@
 # Progress Log
 
+### Phase 8 async rewrite: memconn Completion 模型重写 (2026-07-19)
+
+- **Status:** complete
+- 从 pthread 同步阻塞模型重写为 libxev Completion 异步模型
+- SharedState: 4 个 xev.Async 替代 4 个 ResetEvent（每端点独立读/写通知）
+- MemConn API: read/write/close 全部变为 Completion 回调式（接受 loop + c + cb 参数）
+- OpState 类型: ReadOp/WriteOp/CloseOp — 堆分配，回调完成后自行释放
+- 写路径: 立即写 → 未完成则 re-arm 等待对端消费后再写
+- 读路径: 有数据通知 → popSlice → 回调; 空且 closed → EOF
+- 关闭路径: 原子标志 → 通知对端读/写 Async → 幂等 + refcount 释放
+- MemListener 改为异步 accept（xev.Async notify 唤醒）
+- Registry dial/listen/unlisten 保持同步（Mutex 保护）
+- createPair 接受两组 `*xev.Loop` 参数（local/remote 可不同 loop）
+- PairHandle.destroy() 同步释放（一次释放 2 个 refcount，无 _close_releases）
+- 关键设计决策:
+  - 4 Async 方案（每端点读/写分离）：避免双向传输死锁（写 notify 唤醒的是读而非写）
+  - 双 loop 跨线程模式：每个线程持有独立 xev.Loop，Completion 栈变量与 loop 生命周期绑定
+  - 幂等 close + Registry refcount 释放：不同 MemConn 共享同一 closed 标志，后关闭的连接也在幂等路径释放 refcount
+  - `zig build test` 用 addSystemCommand 代替 addRunArtifact：避免 --listen=- 协议与 libxev 事件循环冲突导致 hang
+- 回归: 219 tests 全绿 + zig fmt OK + zero memory leaks
+- 更新 `src/foundation.zig` 导出 memconn 模块（已有）
+- 更新 `API.md` memconn 章节（同步 → 异步 Completion API）
+- 更新 `build.zig` test step（addRunArtifact → addSystemCommand）
+
+**以下是原同步版本的 entry（已被上方重写取代）：**
+
+### Phase 8 (原版): memconn 内存网络连接 (2026-07-19)
+
+- 新建 `src/memconn.zig` — 进程内 socket-like 网络连接模块
+- 核心类型: MemPipe(buf_size), MemConn, PairHandle, MemListener, Registry
+- 基于现有组件: RingBuf (SPSC 无锁环缓冲) + ResetEvent (跨平台事件)
+- 事件协议: data_ev 通知有数据可用 / space_ev 通知有空间可写 + 双检防丢失唤醒
+- close 语义: 原子标志 → 广播事件 → 释放 refcounted SharedState
+- 跨平台 Mutex（POSIX pthread_mutex_t + Windows 原子自旋锁）
+- 37 测试用例: createPair (15), MemPipe (2), Registry (9), global (2), edge cases (4), cross-thread (5)
+- 修复关键 bug:
+  - 读路径未设置 space_ev → 写者永久阻塞（跨线程大数据量测试）
+  - close() 事件广播与 refcount 释放分离（共享 _closed 标志导致第二方不释放 → memory leak）
+  - read 循环 data_ev 未重置 → busy-loop
+  - `@alignCast` SharedState 对齐 128（RingBuf/ResetEvent 内含高对齐字段）
+  - createPair 直接销毁路径绕过 refcount（见 PairHandle._destroy）
+- 回归: 233 tests 全绿 + zig fmt OK + zero memory leaks
+- 更新 `src/foundation.zig` 导出 memconn 模块
+- 更新 `API.md` memconn 章节 + 0.1.2 changelog
+- 更新 `task_plan.md` Phase 8 条目
+
 ### Phase 7: bug 修复会话 (2026-07-19)
 
 #### P0 修复（Task #7 — 真实环境崩溃）

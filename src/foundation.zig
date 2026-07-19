@@ -9,6 +9,7 @@
 //! - 应用框架 (cli, log, yaml)
 //! - 存储框架 (store)
 //! - 并发原语 (event, queue)
+//! - 内存网络 (memconn)
 //!
 //! 依赖: Zig std + libxev + libyaml C
 //! 目标平台: Windows / macOS / Linux / iOS / Android
@@ -42,6 +43,9 @@ pub const queue = @import("queue.zig");
 // ---- Phase 5: 网络出站 (std + libxev) ----
 pub const egress = @import("egress.zig");
 
+// ---- Phase 8: 内存网络连接 (std + libxev) ----
+pub const memconn = @import("memconn.zig");
+
 test {
     _ = @import("foundation.zig");
     _ = @import("buffer.zig");
@@ -57,4 +61,5 @@ test {
     _ = @import("event.zig");
     _ = @import("queue.zig");
     _ = @import("egress.zig");
+    _ = @import("memconn.zig");
 }
