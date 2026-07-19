@@ -33,6 +33,8 @@ pub const net = @import("net.zig");
 pub const strings = @import("strings.zig");
 pub const cli = @import("cli.zig");
 pub const log = @import("log.zig");
+
+// ---- Phase 3b: 信号处理 (std only) ----
 pub const signal = @import("signal.zig");
 
 // ---- Phase 4: 存储、配置与并发 (std + libyaml) ----

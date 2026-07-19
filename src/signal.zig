@@ -236,16 +236,18 @@ const win32 = struct {
 fn installWindowsHandlers() !void {
     const handler = struct {
         fn handle(ctrl_type: u32) callconv(.winapi) i32 {
-            if (ctrl_type == 0 or ctrl_type == 2) {
-                triggerCallbacks(.interrupt);
-                return 1;
+            switch (ctrl_type) {
+                0, 1, 2, 5, 6 => {
+                    triggerCallbacks(.interrupt);
+                    return 1;
+                },
+                else => return 0,
             }
-            return 0;
         }
     }.handle;
 
     if (win32.SetConsoleCtrlHandler(handler, 1) == 0) {
-        return error.InstallHandlerFailed;
+        return error.SignalInstallFailed;
     }
 }
 
