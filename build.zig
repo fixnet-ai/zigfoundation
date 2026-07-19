@@ -84,7 +84,7 @@ pub fn build(b: *std.Build) void {
         .root_module = example_cli_mod,
     });
     const example_cli_install = b.addInstallArtifact(example_cli, .{});
-    const example_cli_step = b.step("example-cli", "构建 CLI 示例程序，集成测试所有 13 模块");
+    const example_cli_step = b.step("example-cli", "构建 CLI 示例程序，集成测试所有 14 模块");
     example_cli_step.dependOn(&example_cli_install.step);
 
     // ---- 示例：iOS 静态库 (aarch64-ios-simulator / x86_64-ios-simulator) ----
@@ -187,6 +187,9 @@ pub fn build(b: *std.Build) void {
     });
     if (libc_file_opt) |lf| {
         android_test_exe.setLibCFile(.{ .cwd_relative = lf });
+    }
+    if (sysroot) |s| {
+        android_test_exe.root_module.addObjectFile(.{ .cwd_relative = b.pathJoin(&.{ s, "usr", "lib", "aarch64-linux-android", "liblog.so" }) });
     }
     const android_test_install = b.addInstallArtifact(android_test_exe, .{});
     const android_test_step = b.step("android-test", "构建 Android 可执行测试 (adb push + shell 运行)");

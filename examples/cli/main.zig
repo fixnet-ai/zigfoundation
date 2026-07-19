@@ -1,4 +1,4 @@
-//! zigfoundation 集成测试 CLI — 完整测试全部 13 个模块
+//! zigfoundation 集成测试 CLI — 完整测试全部 14 个模块
 //!
 //! 构建: zig build example-cli
 //! 运行: ./zig-out/bin/zigfoundation-example-cli

@@ -225,7 +225,7 @@ const zli_module = zli_dep.module("zli");
 lib_module.addImport("zli", zli_module);
 ```
 
-### 1.12 模块名 import vs 文件路径 import 歧义
+### 1.13 模块名 import vs 文件路径 import 歧义
 
 当 `build.zig` 注册了模块名 `X` 指向 `src/X/mod.zig`，且 root module 中同时存在 `src/X/mod.zig`：
 
@@ -237,7 +237,7 @@ const x = @import("X");  // 模块名查找 vs 文件路径查找冲突
 const x = @import("X/mod.zig");
 ```
 
-### 1.13 `@hasField` 不支持指针类型
+### 1.14 `@hasField` 不支持指针类型
 
 ```zig
 // ❌ 错误: type '*const T' does not support '@hasField'
@@ -250,7 +250,7 @@ if (@hasField(CfgT, "tun")) { ... }
 
 注意: `std.meta.Child` 只能用于 pointer/optional/array/vector，对 struct value 会报错。field access 通过指针会自动 deref，所以第二层起不要再包 `Child`。
 
-### 1.14 `//!` 文档注释只能出现在文件头部
+### 1.15 `//!` 文档注释只能出现在文件头部
 
 `//!` 是文件级文档注释，必须在所有声明之前。文件中间只能用 `///` 或 `//`。
 
@@ -909,7 +909,7 @@ const UdpRecvFn = *const fn (arg: ?*anyopaque, pcb: *Pcb, p: *Pbuf, addr: ?*cons
 
 ### 9.1 `zig build test` 不收集 transitive 文件的 test 块
 
-只有 root source file 的 test 块被运行。transitively `@import` 的文件中的测试需要独立 `addTest` step。
+参见 [4.7](#47-测试不自动收集-transitive-文件的-test-块)。
 
 ### 9.2 测试中修改全局状态必须 defer 还原
 

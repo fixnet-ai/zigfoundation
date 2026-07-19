@@ -29,18 +29,18 @@ pub const endian = @import("endian.zig");
 pub const platform = @import("platform.zig");
 pub const net = @import("net.zig");
 
-// ---- Phase 3: 应用框架 (std only) ----
+// ---- Phase 3: 应用框架 (std + zli) ----
 pub const strings = @import("strings.zig");
 pub const cli = @import("cli.zig");
 pub const log = @import("log.zig");
 
-// ---- Phase 4: 存储、配置与并发 (libyaml + libxev) ----
+// ---- Phase 4: 存储、配置与并发 (std + libyaml) ----
 pub const yaml = @import("yaml.zig");
 pub const store = @import("store.zig");
 pub const event = @import("event.zig");
 pub const queue = @import("queue.zig");
 
-// ---- Phase 5: 网络出站 (std + libxev) ----
+// ---- Phase 5: 网络出站 (std only) ----
 pub const egress = @import("egress.zig");
 
 // ---- Phase 8: 内存网络连接 (std + libxev) ----

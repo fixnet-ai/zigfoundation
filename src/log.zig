@@ -1,8 +1,8 @@
 //! 跨平台分级日志框架 — 基于 std.log 集成
 //!
 //! 平台适配：
-//! - Android: stderr（原生程序 stderr 输出到 logcat）
-//! - iOS / macOS: stderr
+//! - Android: `__android_log_write` (logcat)，带优先级和 tag
+//! - iOS / macOS: `syslog`，集成系统日志
 //! - Linux / Windows: stderr (ANSI 颜色)
 //!
 //! 通过 `std_options.logFn` 覆盖 std.log 的默认行为，
@@ -102,32 +102,78 @@ fn platformWrite(
     const prefix: []const u8 = prefix_owned orelse "";
     defer if (prefix_owned) |p| std.heap.page_allocator.free(p);
 
-    // Android 原生程序 stderr 也会输出到 logcat，无需单独调用 __android_log_write
-    _ = .{ level, prefix, msg };
     switch (builtin.os.tag) {
-        .ios, .macos, .tvos, .watchos => darwinLog(level, prefix, msg),
-        .linux, .windows => desktopLog(level, prefix, msg),
+        .linux => {
+            if (builtin.abi == .android) {
+                androidLog(level, prefix, msg);
+            } else {
+                desktopLog(level, prefix, msg);
+            }
+        },
+        .ios, .tvos, .watchos, .visionos => syslogLog(level, prefix, msg),
+        .macos, .windows => desktopLog(level, prefix, msg),
         else => desktopLog(level, prefix, msg),
     }
 }
 
 // ============================================================
-// Darwin (iOS / macOS) — stderr
+// Android — __android_log_write (logcat)
 // ============================================================
 
-fn darwinLog(level: Level, prefix: []const u8, msg: []const u8) void {
-    const color = switch (level) {
-        .err => "\x1b[31m",
-        .warn => "\x1b[33m",
-        .info => "\x1b[32m",
-        .debug => "\x1b[36m",
+const android_log = struct {
+    const ANDROID_LOG_DEBUG: c_int = 3;
+    const ANDROID_LOG_INFO: c_int = 4;
+    const ANDROID_LOG_WARN: c_int = 5;
+    const ANDROID_LOG_ERROR: c_int = 6;
+    extern "c" fn __android_log_write(prio: c_int, tag: [*:0]const u8, text: [*:0]const u8) c_int;
+};
+
+fn androidLog(level: Level, prefix: []const u8, msg: []const u8) void {
+    const prio = switch (level) {
+        .err => android_log.ANDROID_LOG_ERROR,
+        .warn => android_log.ANDROID_LOG_WARN,
+        .info => android_log.ANDROID_LOG_INFO,
+        .debug => android_log.ANDROID_LOG_DEBUG,
     };
-    const reset = "\x1b[0m";
 
-    const line = std.fmt.allocPrint(std.heap.page_allocator, "zigfoundation: {s}{s}{s}{s}\n", .{ color, prefix, msg, reset }) catch return;
-    defer std.heap.page_allocator.free(line);
+    const total_len = prefix.len + msg.len;
+    const buf = std.heap.page_allocator.alloc(u8, total_len + 1) catch return;
+    defer std.heap.page_allocator.free(buf);
+    @memcpy(buf[0..prefix.len], prefix);
+    @memcpy(buf[prefix.len..total_len], msg);
+    buf[total_len] = 0;
 
-    _ = std.c.write(2, line.ptr, line.len);
+    _ = android_log.__android_log_write(prio, "zigfoundation", @ptrCast(buf.ptr));
+}
+
+// ============================================================
+// Darwin (iOS / tvOS / watchOS / visionOS) — syslog
+// ============================================================
+
+const syslog_c = struct {
+    const LOG_ERR: c_int = 3;
+    const LOG_WARNING: c_int = 4;
+    const LOG_INFO: c_int = 6;
+    const LOG_DEBUG: c_int = 7;
+    extern "c" fn syslog(priority: c_int, format: [*:0]const u8, ...) void;
+};
+
+fn syslogLog(level: Level, prefix: []const u8, msg: []const u8) void {
+    const priority = switch (level) {
+        .err => syslog_c.LOG_ERR,
+        .warn => syslog_c.LOG_WARNING,
+        .info => syslog_c.LOG_INFO,
+        .debug => syslog_c.LOG_DEBUG,
+    };
+
+    const total_len = prefix.len + msg.len;
+    const buf = std.heap.page_allocator.alloc(u8, total_len + 1) catch return;
+    defer std.heap.page_allocator.free(buf);
+    @memcpy(buf[0..prefix.len], prefix);
+    @memcpy(buf[prefix.len..total_len], msg);
+    buf[total_len] = 0;
+
+    syslog_c.syslog(priority, "%s", @ptrCast(buf.ptr));
 }
 
 // ============================================================

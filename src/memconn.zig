@@ -496,7 +496,7 @@ pub const PairHandle = struct {
     /// 释放共享状态（同步，调用前确保无 pending completions）。
     ///
     /// 设置关闭标志、通知对端 pending 操作，然后释放两个引用计数。
-    /// 可安全多次调用（close 不会释放 PairHandle 连接的引用）。
+    /// 不可多次调用 — 引用计数 2→0 后 SharedState 被释放，重复调用导致 use-after-free。
     pub fn destroy(self: *PairHandle) void {
         self.local.closed.store(true, .release);
         self.local.peer_read_async.notify() catch {};

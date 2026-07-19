@@ -2,7 +2,7 @@
 
 ## Requirements
 - 从 zigproxy/zproxy/zigtun 提取公共组件到 zigfoundation
-- 依赖：Zig std + libxev（异步基础）+ libyaml C 库（yaml 模块），不再使用 zio
+- 依赖：Zig std + zli (CLI 框架) + libxev（异步基础）+ libyaml C 库（yaml 模块），不再使用 zio
 - 五平台支持：Windows / macOS / Linux / iOS / Android
 - 100% 单元测试覆盖每个 pub fn
 - 工业级稳定性：内存分配可审计、错误路径清晰、无 unsafe 透出
@@ -16,7 +16,7 @@
 - 入口模块：src/foundation.zig（barrel 模块，版本 0.1.0，子模块 import 已预留）
 - 文档：CLAUDE.md、API.md、zig-codegen.md（合并自 zigtun/zigproxy/zproxy）
 - Git 环境：.gitignore、.gitattributes、user.name=fixnet-ai、user.email=noreply
-- Skills：.claude/skills/zig、utm-vm（软链接 → ../../zigbox/.claude/skills/）
+- Skills：.claude/skills/zig（目录）、utm-vm（软链接 → ../../../utm-monitor/utm-vm）
 - 提交历史：d22c375（骨架）→ 6310ac5（zig-codegen.md）→ 5d90ee4（git 基础环境）
 
 ### 依赖分层
@@ -25,13 +25,16 @@
 std only (8 modules):
   buffer  ring  endian
   platform  net
-  strings  cli  log
+  strings  log  egress
+
+std + zli (1 module):
+  cli
 
 std + libyaml C (1 module):
   yaml
 
 std + libxev (4 modules):
-  store  event  queue  socket
+  store  event  queue  memconn
 ```
 
 ### 提取源代码审计
@@ -158,7 +161,7 @@ ring 非环绕算术(32位理论溢出)；endian 泛型短输入 panic 无 check
 | 依赖分层（std → libyaml → libxev） | 明确外部依赖边界，Phase 按依赖递增编排 |
 | ring 而非 ringbuf | Zig 惯用短名，std.RingBuffer 前例 |
 | yaml 而非 config | 只封装 libyaml 解析/序列化，不承载业务配置，名字诚实 |
-| socket 而非 egress | 出站路由绑定本质是 socket 层操作，对开发者更直观 |
+| egress 而非 socket | 强调"出站路由绑定"语义，与普通 socket 创建区分 |
 | store 路径注入 | 注入模式，调用者传入路径并初始化，模块不持有全局状态 |
 | 不含 DNS | 应用层，属于 zproxy/zigproxy |
 | 不含 checksum | 不提供 |
@@ -252,9 +255,39 @@ Completion 在回调触发前释放 = use-after-free。
 
 **修复**: 幂等路径中，若 `_close_releases = true`（Registry 模式），也调用 `shared_release` 释放引用。
 
-### Windows 交叉编译修复 — 已解决 (2026-07-19)
+### 文档矛盾点修复 (2026-07-20)
 
-**问题**: `aarch64-windows-gnu` 测试二进制 5 个编译错误，全部预先存在（与 memconn 无关）。
+审查中发现 6 处文档/注释与代码不符，逐一修复：
+
+| # | 位置 | 矛盾 | 修复 |
+|---|------|------|------|
+| 1 | memconn.zig:499 | destroy() 注释"可安全多次调用"，实际 refcount 2→0 后 use-after-free | 注释改为"不可多次调用" |
+| 2 | foundation.zig:32-44 | Phase 3 标 std only(cli 用 zli)、Phase 4 标 libyaml+libxev(store/event/queue 都不用)、Phase 5 标 std+libxev(egress 纯 std) | Phase 3: std+zli, Phase 4: std+libyaml, Phase 5: std only |
+| 3 | buffer.zig | API.md/struct 注释 initial_blocks=256(2MB)，defaultConfig() 实际返回 0 | API.md 改为说明初始为 0，按需扩展 |
+| 4 | store.zig | API.md 写"sync 后 rename"，代码注释"不显式 fsync" | 保持现状，信任 OS |
+| 5 | log.zig | API.md/CLAUDE.md 写 Android __android_log_write + iOS/macOS syslog，实际全 stderr | Android: __android_log_write, iOS: syslog, macOS: 保持 stderr |
+| 6 | README.md | CLAUDE.md 引用为必读文件但不存在 | 创建简洁 GitHub README |
+
+### log.zig 平台增强 (2026-07-20)
+
+**Android**: 添加 `extern "c" fn __android_log_write(prio: c_int, tag: [*:0]const u8, text: [*:0]const u8) c_int`，优先级映射: err→ANDROID_LOG_ERROR(6), warn→ANDROID_LOG_WARN(5), info→ANDROID_LOG_INFO(4), debug→ANDROID_LOG_DEBUG(3)，tag="zigfoundation"。
+
+**iOS/tvOS/watchOS/visionOS**: 添加 `extern "c" fn syslog(priority: c_int, format: [*:0]const u8, ...) void`，优先级映射: err→LOG_ERR(3), warn→LOG_WARNING(4), info→LOG_INFO(6), debug→LOG_DEBUG(7)。
+
+**macOS**: 保持 stderr+ANSI 颜色。syslog 在 macOS 已 deprecated，CLI 开发者需要终端输出。
+
+**非目标平台安全**: extern 声明放在 const struct 内部，Zig 惰性分析避免非目标平台链接报错。验证: `zig build test` 219/219 ✅（macOS host）。
+
+**Android 交叉编译修复**: 
+- `comptime_int` 常量需显式 `: c_int` 类型标注（编译期 int 在 runtime switch 中无法确定类型）
+- `linkSystemLibrary("log", .{})` — NDK 中 `paths_first` 策略搜索路径为空且 `addLibraryPath` 会 double-prefix sysroot
+- 解决: `addObjectFile(.{ .cwd_relative = "<sysroot>/usr/lib/aarch64-linux-android/liblog.so" })` 直接链接 + `ln -sf 36/liblog.so` symlink
+- Android 构建验证: `aarch64-linux-android` ELF pie executable 6.4MB ✅
+
+**原始问题**: `aarch64-windows-gnu` 测试二进制 5 个编译错误。
+
+**已修复**: Phase 9 中通过全局分析修复了三组类型问题（pthread void / nanosleep / zli remaining）。
+**2026-07-20 重新验证**: `zig build test-build -Dtarget=aarch64-windows-gnu` → PE32+ AArch64 可执行文件 ✅，`zig build example-cli -Dtarget=aarch64-windows-gnu` → 同样成功 ✅。之前 5 个错误均已消除。
 
 **全局分析**（不逐行修补）:
 

@@ -1,6 +1,6 @@
 //! YAML 解析封装 — 基于 libyaml C 库的薄封装
 //!
-//! 通过 build.zig 的 `addTranslateC` + `addCSourceFiles` 编译和链接 libyaml。
+//! 通过 vendor/yaml 独立 Zig 包（`b.dependency("yaml")`）编译和链接 libyaml。
 //! 本模块提供 `Document` 类型，封装 `yaml_document_t` 并提供 Zig 友好的节点导航 API。
 //!
 //! 不包含任何业务配置结构（如代理、TUN、DNS 配置），仅提供通用的 YAML 解析能力。

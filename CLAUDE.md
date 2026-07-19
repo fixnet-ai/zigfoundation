@@ -134,10 +134,10 @@ vendor/yaml/
 ### 依赖分层
 
 ```
-std only (7):     buffer  ring  endian  platform  net  strings  log
+std only (8):     buffer  ring  endian  platform  net  strings  log  egress
 std + zli (1):    cli
 std + libyaml (1): yaml
-std + libxev (4):  store  event  queue  egress
+std + libxev (4):  store  event  queue  memconn
 ```
 
 ### Phase 1 — 内存管理（std only）
@@ -145,14 +145,14 @@ std + libxev (4):  store  event  queue  egress
 | 模块 | 来源 | 描述 |
 |------|------|------|
 | `buffer.zig` | 从 zigproxy 提取 | BufferPool: LIFO 复用、shrink-to-initial 策略 |
-| `ring.zig` | 从 zproxy 提取 | SPSC RingBuf: 跨线程无锁环缓冲区 |
+| `ring.zig` | 从 zigproxy 提取 | SPSC RingBuf: 跨线程无锁环缓冲区 |
 | `endian.zig` | 新建薄封装 | 大小端读写统一 API (消除各处散落的 std.mem.readInt) |
 
 ### Phase 2 — 平台与网络（std only）
 
 | 模块 | 来源 | 描述 |
 |------|------|------|
-| `platform.zig` | 合并 zigproxy + zigtun + zproxy | 时间获取、平台检测、系统资源探测 (CPU/fd/线程池)、系统 DNS 探测 |
+| `platform.zig` | 合并 zigproxy + zproxy | 时间获取、平台检测、系统资源探测 (CPU/fd/线程池)、跨平台睡眠、系统 DNS 探测 |
 | `net.zig` | 从 zproxy/utils.zig 提取 | IP 格式化/解析、完整 IPv4/v6 CIDR 接口、域名判断、parseHostPort。不含 checksum |
 
 ### Phase 3 — 应用框架（std only + zli）
@@ -232,10 +232,10 @@ std + libxev (4):  store  event  queue  egress
 
 ### 依赖规则
 
-- std only 模块 (7个)：buffer、ring、endian、platform、net、strings、log — 不依赖 libxev
+- std only 模块 (8个)：buffer、ring、endian、platform、net、strings、log、egress — 不依赖 libxev 或 zli
 - std + zli (1个)：cli — 依赖 zli v5.1.2 CLI 框架
 - std + libyaml (1个)：yaml — 仅依赖 std + libyaml C 库
-- std + libxev (4个)：store、event、queue、egress — 可依赖 std + libxev
+- std + libxev (4个)：store、event、queue、memconn — 可依赖 std + libxev
 - 禁止引入 zio 或任何其他第三方框架（zli 除外，已纳入标准依赖）
 
 ### 代码编写
