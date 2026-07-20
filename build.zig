@@ -28,7 +28,7 @@ pub fn build(b: *std.Build) void {
     // =======================================================================
 
     const lib_module = b.createModule(.{
-        .root_source_file = b.path("src/foundation.zig"),
+        .root_source_file = b.path("src/mod.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -38,7 +38,7 @@ pub fn build(b: *std.Build) void {
 
     // 注册模块供外部依赖通过 dep.module("zigfoundation") 访问
     const pub_module = b.addModule("zigfoundation", .{
-        .root_source_file = b.path("src/foundation.zig"),
+        .root_source_file = b.path("src/mod.zig"),
         .target = target,
         .optimize = optimize,
     });

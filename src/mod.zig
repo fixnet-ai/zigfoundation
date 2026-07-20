@@ -55,7 +55,7 @@ pub const tunconn = @import("tunconn.zig");
 pub const relay = @import("relay.zig");
 
 test {
-    _ = @import("foundation.zig");
+    _ = @import("mod.zig");
     _ = @import("buffer.zig");
     _ = @import("ring.zig");
     _ = @import("endian.zig");
