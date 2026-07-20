@@ -9,6 +9,7 @@
 //! 依赖：zigfoundation.net (SocksAddr)、std.posix.socket_t
 
 const std = @import("std");
+const builtin = @import("builtin");
 const net = @import("net.zig");
 
 // ============================================================================
@@ -372,6 +373,14 @@ test "tunconn: DirectRouteDestination close + isClosed" {
 
 // ---- TcpConn mock ----
 
+/// 跨平台 socket_t 字面量 — Windows socket_t 为指针，POSIX 为整数。
+fn testFd(v: usize) std.posix.socket_t {
+    if (builtin.os.tag == .windows) {
+        return @ptrFromInt(v);
+    }
+    return @intCast(v);
+}
+
 const MockTcpConn = struct {
     read_buf: []u8 = &.{},
     written: ?[]const u8 = null,
@@ -464,9 +473,9 @@ test "tunconn: TcpConn localAddr / remoteAddr" {
 }
 
 test "tunconn: TcpConn fd present" {
-    var mock = MockTcpConn{ .fd_val = 42 };
+    var mock = MockTcpConn{ .fd_val = testFd(42) };
     const conn = mock.toConn();
-    try testing.expectEqual(@as(?std.posix.socket_t, 42), conn.fd());
+    try testing.expectEqual(@as(?std.posix.socket_t, testFd(42)), conn.fd());
 }
 
 test "tunconn: TcpConn fd null" {
@@ -581,9 +590,9 @@ test "tunconn: UdpConn localAddr" {
 }
 
 test "tunconn: UdpConn fd present" {
-    var mock = MockUdpConn{ .fd_val = 99 };
+    var mock = MockUdpConn{ .fd_val = testFd(99) };
     const conn = mock.toConn();
-    try testing.expectEqual(@as(?std.posix.socket_t, 99), conn.fd());
+    try testing.expectEqual(@as(?std.posix.socket_t, testFd(99)), conn.fd());
 }
 
 test "tunconn: UdpConn fd null" {
@@ -710,6 +719,6 @@ test "tunconn: Handler newPacketConnection" {
 test "tunconn: Handler protect" {
     var mock = MockHandler{};
     const h = mock.toHandler();
-    try h.protect(123);
-    try testing.expectEqual(@as(?std.posix.socket_t, 123), mock.protected_fd);
+    try h.protect(testFd(123));
+    try testing.expectEqual(@as(?std.posix.socket_t, testFd(123)), mock.protected_fd);
 }

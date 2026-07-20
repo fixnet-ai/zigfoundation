@@ -480,13 +480,13 @@ fn getDefaultInterfaceViaProcNetRoute() ?u32 {
 fn getDefaultInterfaceViaGetBestInterface() ?u32 {
     const windows = std.os.windows;
 
-    const hModule = windows.LoadLibraryA("iphlpapi.dll") orelse {
+    const hModule = winDyn.loadLibrary("iphlpapi.dll") orelse {
         std.log.warn("[egress] cannot load iphlpapi.dll", .{});
         return null;
     };
-    defer _ = windows.FreeLibrary(hModule);
+    defer _ = winDyn.freeLibrary(hModule);
 
-    const func_ptr = windows.GetProcAddress(hModule, "GetBestInterface");
+    const func_ptr = winDyn.getProcAddress(hModule, "GetBestInterface");
     if (func_ptr == null) {
         std.log.warn("[egress] GetBestInterface not found in iphlpapi.dll", .{});
         return null;
@@ -495,7 +495,7 @@ fn getDefaultInterfaceViaGetBestInterface() ?u32 {
     const FnType = *const fn (
         ipAddr: ?*anyopaque,
         bestIfIndex: *windows.DWORD,
-    ) callconv(windows.WINAPI) windows.DWORD;
+    ) callconv(.winapi) windows.DWORD;
     const fn_ptr: FnType = @ptrCast(@alignCast(func_ptr));
 
     var best_idx: windows.DWORD = 0;
@@ -507,6 +507,29 @@ fn getDefaultInterfaceViaGetBestInterface() ?u32 {
     std.log.warn("[egress] GetBestInterface failed: ret={d}", .{ret});
     return null;
 }
+
+/// Windows DLL 动态加载工具 — kernel32 LoadLibraryA / FreeLibrary / GetProcAddress。
+/// Zig 0.16.0 的 std.os.windows 不再直接暴露这些函数，需要本地声明。
+const winDyn = struct {
+    const HMODULE = *anyopaque;
+    const FARPROC = *anyopaque;
+    extern "kernel32" fn LoadLibraryA(lpLibFileName: [*:0]const u8) callconv(.winapi) HMODULE;
+    extern "kernel32" fn FreeLibrary(hLibModule: HMODULE) callconv(.winapi) i32;
+    extern "kernel32" fn GetProcAddress(hModule: HMODULE, lpProcName: [*:0]const u8) callconv(.winapi) ?FARPROC;
+
+    fn loadLibrary(name: [*:0]const u8) ?HMODULE {
+        const h = LoadLibraryA(name);
+        return if (@intFromPtr(h) == 0) null else h;
+    }
+
+    fn freeLibrary(h: HMODULE) void {
+        _ = FreeLibrary(h);
+    }
+
+    fn getProcAddress(h: HMODULE, name: [*:0]const u8) ?FARPROC {
+        return GetProcAddress(h, name);
+    }
+};
 
 /// fallback: 按优先级顺序尝试常见接口名，第一个存在即返回其索引
 fn getDefaultInterfaceIndexFallback() ?u32 {
