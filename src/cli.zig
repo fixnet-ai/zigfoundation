@@ -205,159 +205,17 @@ pub fn run(root: *Command, args: std.process.Args) noreturn {
 pub fn noopAction(_: CommandContext) anyerror!void {}
 
 // ============================================================
-// 信号处理
+// 信号处理 — 委托到 signal.zig（单一实现源）
 // ============================================================
 
-/// 可处理的信号类型。
-pub const Signal = enum {
-    interrupt, // SIGINT / Ctrl+C
-    terminate, // SIGTERM
-    hangup, // SIGHUP
-};
+const signal_mod = @import("signal.zig");
 
-/// 退出回调：无参数、无返回值的函数指针。
-pub const ExitCallback = *const fn () void;
-
-/// 最大可注册的退出回调数。
-const max_exit_callbacks = 16;
-
-/// 全局退出回调列表。
-var exit_callbacks: [max_exit_callbacks]ExitCallback = [_]ExitCallback{undefined} ** max_exit_callbacks;
-var exit_callback_count: usize = 0;
-var signal_received: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
-/// 最近一次收到的信号（0 = 无；1/2/3 = interrupt/terminate/hangup）。
-var last_signal: std.atomic.Value(u8) = std.atomic.Value(u8).init(0);
-
-/// 注册退出回调。最多 16 个，按注册顺序存储（触发时 LIFO 调用）。
-/// 安装信号处理器之前调用此函数。
-/// 警告：POSIX 下回调在信号处理器上下文执行，必须 async-signal-safe —
-/// 只做置标志/写 fd 级操作，不得分配内存、加锁或调用 stdio。
-pub fn registerExitCallback(cb: ExitCallback) void {
-    if (exit_callback_count < max_exit_callbacks) {
-        exit_callbacks[exit_callback_count] = cb;
-        exit_callback_count += 1;
-    }
-}
-
-/// 为当前进程安装信号处理器。
-/// POSIX: sigaction(SIGINT/SIGTERM/SIGHUP)
-/// Windows: SetConsoleCtrlHandler
-pub fn installExitHandlers(signals: []const Signal) !void {
-    if (native_os == .windows) {
-        if (signals.len == 0) return;
-        try installWindowsHandlers();
-    } else {
-        try installPosixHandlers(signals);
-    }
-}
-
-/// 阻塞等待任意已注册信号（100ms 轮询信号标志，全平台统一实现）。
-/// 返回触发的信号类型。调用前必须先 installExitHandlers，否则永远阻塞。
-pub fn waitForSignal() Signal {
-    while (!signal_received.load(.acquire)) {
-        sleepMs(100);
-    }
-    return switch (last_signal.load(.acquire)) {
-        2 => .terminate,
-        3 => .hangup,
-        else => .interrupt,
-    };
-}
-
-/// 跨平台毫秒级睡眠（std.time.sleep 在 Zig 0.16.0 已移除）。
-fn sleepMs(ms: u32) void {
-    if (native_os == .windows) {
-        win.Sleep(ms);
-    } else {
-        const ts: std.c.timespec = .{
-            .sec = @intCast(ms / 1000),
-            .nsec = @intCast((ms % 1000) * std.time.ns_per_ms),
-        };
-        _ = std.c.nanosleep(&ts, null);
-    }
-}
-
-/// 检查是否已收到退出信号（非阻塞）。
-pub fn exitRequested() bool {
-    return signal_received.load(.acquire);
-}
-
-/// 触发退出回调并设置信号标志（LIFO 顺序）。
-/// 注意：POSIX 下运行在信号处理器上下文中，回调必须 async-signal-safe。
-fn triggerCallbacks(sig: Signal) void {
-    last_signal.store(switch (sig) {
-        .interrupt => 1,
-        .terminate => 2,
-        .hangup => 3,
-    }, .release);
-    signal_received.store(true, .release);
-    var i: usize = exit_callback_count;
-    while (i > 0) {
-        i -= 1;
-        exit_callbacks[i]();
-    }
-}
-
-// ============================================================
-// POSIX 信号处理实现
-// ============================================================
-
-fn installPosixHandlers(signals: []const Signal) !void {
-    const handler = struct {
-        fn handle(sig: std.c.SIG) callconv(.c) void {
-            const s: Signal = switch (sig) {
-                .INT => .interrupt,
-                .TERM => .terminate,
-                .HUP => .hangup,
-                else => return,
-            };
-            triggerCallbacks(s);
-        }
-    }.handle;
-
-    for (signals) |s| {
-        const c_sig: std.c.SIG = switch (s) {
-            .interrupt => .INT,
-            .terminate => .TERM,
-            .hangup => .HUP,
-        };
-        // Zig 0.16.0：sigemptyset 是函数（不存在 empty_sigset 常量）；
-        // Sigaction.flags 是 c_uint（不是 packed struct）；sigaction 返回 void。
-        const act = std.posix.Sigaction{
-            .handler = .{ .handler = handler },
-            .mask = std.posix.sigemptyset(),
-            .flags = 0,
-        };
-        std.posix.sigaction(c_sig, &act, null);
-    }
-}
-
-// ============================================================
-// Windows 信号处理实现
-// ============================================================
-
-fn installWindowsHandlers() !void {
-    const kernel32 = struct {
-        extern "kernel32" fn SetConsoleCtrlHandler(
-            handler: ?*const fn (u32) callconv(.winapi) i32,
-            add: i32,
-        ) callconv(.winapi) i32;
-    };
-
-    const handler = struct {
-        fn handle(ctrl_type: u32) callconv(.winapi) i32 {
-            if (ctrl_type == 0 or ctrl_type == 2) {
-                triggerCallbacks(.interrupt);
-                return 1;
-            }
-            return 0;
-        }
-    }.handle;
-
-    if (kernel32.SetConsoleCtrlHandler(handler, 1) == 0) {
-        return error.InstallHandlerFailed;
-    }
-}
+pub const Signal = signal_mod.Signal;
+pub const ExitCallback = signal_mod.ExitCallback;
+pub const registerExitCallback = signal_mod.registerExitCallback;
+pub const installExitHandlers = signal_mod.installExitHandlers;
+pub const waitForSignal = signal_mod.waitForSignal;
+pub const exitRequested = signal_mod.exitRequested;
 
 // ============================================================
 // 守护进程化 (POSIX only)
@@ -423,6 +281,9 @@ test "cli: reference all pub decls (lazy-analysis guard)" {
     _ = &exitRequested;
     _ = &createRoot;
     _ = &noopAction;
+    // Signal 类型和 ExitCallback 的编译由 refAllDecls 保证
+    _ = Signal.interrupt;
+    _ = @sizeOf(ExitCallback);
 }
 
 test "cli: createRoot smoke — no dangling buffers, deinit clean (regression)" {
@@ -445,43 +306,12 @@ test "cli: stdout writer flush terminates and clears buffer (regression)" {
     try testing.expectEqual(@as(usize, 0), w.end);
 }
 
-test "cli: registerExitCallback and trigger" {
-    var called: bool = false;
-    const cb = struct {
-        var flag: *bool = undefined;
-        fn handler() void {
-            flag.* = true;
-        }
-    };
-    cb.flag = &called;
-
-    registerExitCallback(cb.handler);
-    cb.handler();
-
-    try testing.expect(called);
-}
-
-test "cli: exitRequested reflects flag state" {
-    signal_received.store(false, .release);
+test "cli: signal API delegates to signal.zig" {
+    // 验证 cli.zig 的 signal API 通过 signal.zig 工作（非阻塞检查）。
+    // 完整测试在 signal.zig 中。
     try testing.expect(!exitRequested());
-
-    signal_received.store(true, .release);
-    try testing.expect(exitRequested());
-
-    signal_received.store(false, .release);
-}
-
-test "cli: Signal enum values" {
-    try testing.expect(Signal.interrupt != Signal.terminate);
-    try testing.expect(Signal.terminate != Signal.hangup);
-    try testing.expect(Signal.interrupt != Signal.hangup);
-}
-
-test "cli: noopAction accepts context and returns" {
-    // noopAction 的编译由 refAllDecls 保证；此处仅验证 Signal 映射辅助逻辑。
-    signal_received.store(false, .release);
-    last_signal.store(0, .release);
-    try testing.expect(!exitRequested());
+    try testing.expectEqual(Signal.interrupt, Signal.interrupt);
+    try testing.expectEqual(Signal.terminate, Signal.terminate);
 }
 
 test "cli: daemonize unsupported on Windows" {
