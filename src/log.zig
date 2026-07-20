@@ -223,11 +223,33 @@ fn logWinGetStdHandle(which: logWin.DWORD) logWin.HANDLE {
     return logWin.GetStdHandle(which);
 }
 
+/// 从字符串解析日志级别（不区分大小写）。
+/// 支持: "trace"→.debug, "debug"→.debug, "info"→.info, "warn"→.warn, "err"→.err。
+/// 未识别时默认返回 .info。
+pub fn parseLevel(s: []const u8) Level {
+    if (std.mem.eql(u8, s, "trace")) return .debug;
+    if (std.mem.eql(u8, s, "debug")) return .debug;
+    if (std.mem.eql(u8, s, "info")) return .info;
+    if (std.mem.eql(u8, s, "warn")) return .warn;
+    if (std.mem.eql(u8, s, "err")) return .err;
+    return .info;
+}
+
 // ============================================================
 // 测试
 // ============================================================
 
 const testing = std.testing;
+
+test "log: parseLevel returns correct level" {
+    try testing.expectEqual(Level.debug, parseLevel("trace"));
+    try testing.expectEqual(Level.debug, parseLevel("debug"));
+    try testing.expectEqual(Level.info, parseLevel("info"));
+    try testing.expectEqual(Level.warn, parseLevel("warn"));
+    try testing.expectEqual(Level.err, parseLevel("err"));
+    try testing.expectEqual(Level.info, parseLevel("unknown"));
+    try testing.expectEqual(Level.info, parseLevel(""));
+}
 
 test "log: reference all pub decls (lazy-analysis guard)" {
     testing.refAllDecls(@This());

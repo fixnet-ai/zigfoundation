@@ -355,6 +355,173 @@ else
     };
 
 // ============================================================================
+// 默认网卡检测 — 找到物理网卡索引，用于出站 socket 绑定绕过 TUN 路由循环
+// ============================================================================
+
+/// 检测默认物理网卡索引。
+/// 通过路由表查找默认网关的实际接口，各平台实现不同：
+///   - macOS: fork+exec route -n get default 解析 interface: 行
+///   - Linux: 解析 /proc/net/route 中 Destination=00000000 行
+///   - Windows: 动态加载 GetBestInterface (iphlpapi.dll)
+/// 所有平台方法失败 → fallback 到候选名列表 → 无结果返回 null
+pub fn getDefaultInterfaceIndex() ?u32 {
+    if (builtin.os.tag == .macos) {
+        if (getDefaultInterfaceViaRoute()) |idx| return idx;
+    } else if (builtin.os.tag == .linux) {
+        if (getDefaultInterfaceViaProcNetRoute()) |idx| return idx;
+    } else if (builtin.os.tag == .windows) {
+        if (getDefaultInterfaceViaGetBestInterface()) |idx| return idx;
+    }
+    return getDefaultInterfaceIndexFallback();
+}
+
+/// 将网卡名转换为索引（需要以 null 结尾的缓冲区）
+pub fn ifNameToIndex(name: []const u8) ?u32 {
+    var buf: [16]u8 = [_]u8{0} ** 16;
+    @memcpy(buf[0..@min(name.len, 15)], name[0..@min(name.len, 15)]);
+    const idx = std.c.if_nametoindex(buf[0..16 :0].ptr);
+    return if (idx > 0) @as(u32, @intCast(idx)) else null;
+}
+
+/// macOS: 通过 fork+exec "route -n get default" 查找默认接口
+fn getDefaultInterfaceViaRoute() ?u32 {
+    var pipe_fds: [2]std.c.fd_t = undefined;
+    if (std.c.pipe(&pipe_fds) != 0) {
+        std.log.warn("[egress] pipe() failed", .{});
+        return null;
+    }
+
+    const pid = std.c.fork();
+    if (pid < 0) {
+        std.log.warn("[egress] fork() failed", .{});
+        return null;
+    }
+
+    if (pid == 0) {
+        // 子进程：stdout → 管道写端，关闭 stderr
+        _ = std.c.close(pipe_fds[0]);
+        _ = std.c.dup2(pipe_fds[1], std.c.STDOUT_FILENO);
+        _ = std.c.close(pipe_fds[1]);
+        _ = std.c.close(std.c.STDERR_FILENO);
+
+        const argv: [4:null]?[*:0]const u8 = .{ "route", "-n", "get", "default" };
+        const envp: [1:null]?[*:0]const u8 = .{null};
+        _ = std.c.execve("/sbin/route", &argv, &envp);
+        std.c._exit(1);
+    }
+
+    _ = std.c.close(pipe_fds[1]);
+
+    var output_buf: [512]u8 = undefined;
+    var total: usize = 0;
+    while (total < output_buf.len) {
+        const n = std.c.read(pipe_fds[0], output_buf[total..].ptr, output_buf.len - total);
+        if (n <= 0) break;
+        total += @intCast(n);
+    }
+    _ = std.c.close(pipe_fds[0]);
+    _ = std.c.waitpid(pid, null, 0);
+
+    const output = output_buf[0..total];
+    var lines = std.mem.splitScalar(u8, output, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (std.mem.startsWith(u8, trimmed, "interface:")) {
+            const iface = std.mem.trim(u8, trimmed["interface:".len..], " \t");
+            if (iface.len > 0) {
+                if (ifNameToIndex(iface)) |idx| {
+                    std.log.info("[egress] default interface: {s} (index={d}) via route", .{ iface, idx });
+                    return idx;
+                }
+            }
+        }
+    }
+    std.log.warn("[egress] route output missing interface line", .{});
+    return null;
+}
+
+/// Linux: 通过 std.c.open/read 读取 /proc/net/route 查找默认路由接口
+fn getDefaultInterfaceViaProcNetRoute() ?u32 {
+    const flags: std.c.O = .{};
+    const fd = std.c.open("/proc/net/route", flags);
+    if (fd < 0) {
+        std.log.warn("[egress] cannot open /proc/net/route", .{});
+        return null;
+    }
+    defer _ = std.c.close(fd);
+
+    var buf: [4096]u8 = undefined;
+    const n = std.c.read(fd, &buf, buf.len);
+    if (n <= 0) {
+        std.log.warn("[egress] cannot read /proc/net/route", .{});
+        return null;
+    }
+    const content = buf[0..@intCast(n)];
+
+    // 格式: Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    _ = lines.next(); // 跳过标题行
+    while (lines.next()) |line| {
+        var cols = std.mem.splitScalar(u8, line, '\t');
+        const iface = cols.next() orelse continue;
+        const dest = cols.next() orelse continue;
+        if (std.mem.eql(u8, dest, "00000000")) {
+            if (ifNameToIndex(iface)) |idx| {
+                std.log.info("[egress] default interface: {s} (index={d}) via /proc/net/route", .{ iface, idx });
+                return idx;
+            }
+        }
+    }
+    std.log.warn("[egress] no default route in /proc/net/route", .{});
+    return null;
+}
+
+/// Windows: 动态加载 iphlpapi.dll → GetBestInterface 获取默认网卡索引
+fn getDefaultInterfaceViaGetBestInterface() ?u32 {
+    const windows = std.os.windows;
+
+    const hModule = windows.LoadLibraryA("iphlpapi.dll") orelse {
+        std.log.warn("[egress] cannot load iphlpapi.dll", .{});
+        return null;
+    };
+    defer _ = windows.FreeLibrary(hModule);
+
+    const func_ptr = windows.GetProcAddress(hModule, "GetBestInterface");
+    if (func_ptr == null) {
+        std.log.warn("[egress] GetBestInterface not found in iphlpapi.dll", .{});
+        return null;
+    }
+
+    const FnType = *const fn (
+        ipAddr: ?*anyopaque,
+        bestIfIndex: *windows.DWORD,
+    ) callconv(windows.WINAPI) windows.DWORD;
+    const fn_ptr: FnType = @ptrCast(@alignCast(func_ptr));
+
+    var best_idx: windows.DWORD = 0;
+    const ret = fn_ptr(null, &best_idx);
+    if (ret == 0 and best_idx > 0) {
+        std.log.info("[egress] default interface index={d} via GetBestInterface", .{best_idx});
+        return @intCast(best_idx);
+    }
+    std.log.warn("[egress] GetBestInterface failed: ret={d}", .{ret});
+    return null;
+}
+
+/// fallback: 按优先级顺序尝试常见接口名，第一个存在即返回其索引
+fn getDefaultInterfaceIndexFallback() ?u32 {
+    const candidates = [_][]const u8{ "en0", "eth0", "wlan0", "en1", "en2" };
+    for (candidates) |name| {
+        if (ifNameToIndex(name)) |idx| {
+            std.log.info("[egress] default interface: {s} (index={d}) via fallback list", .{ name, idx });
+            return idx;
+        }
+    }
+    std.log.warn("[egress] no default interface detected, outbound sockets will not bypass TUN", .{});
+    return null;
+}
+
+// ============================================================================
 // 测试
 // ============================================================================
 

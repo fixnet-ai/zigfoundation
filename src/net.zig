@@ -586,6 +586,29 @@ pub const IpPrefix = struct {
             },
         };
     }
+
+    /// 解析 CIDR 字符串（如 "10.0.0.1/24" 或 "fe80::1/64"）为 IpPrefix
+    pub fn parse(s: []const u8) !IpPrefix {
+        const slash = std.mem.indexOfScalar(u8, s, '/') orelse
+            return error.InvalidCidr;
+        const ip_str = s[0..slash];
+        const bits_str = s[slash + 1 ..];
+        const bits = std.fmt.parseInt(u8, bits_str, 10) catch return error.InvalidCidr;
+
+        // 尝试 IPv4
+        if (std.Io.net.Ip4Address.parse(ip_str, 0)) |ip4| {
+            if (bits > 32) return error.InvalidCidr;
+            return .{ .addr = .{ .v4 = ip4.bytes }, .bits = bits };
+        } else |_| {}
+
+        // 尝试 IPv6
+        if (std.Io.net.Ip6Address.parse(ip_str, 0)) |ip6| {
+            if (bits > 128) return error.InvalidCidr;
+            return .{ .addr = .{ .v6 = ip6.bytes }, .bits = bits };
+        } else |_| {}
+
+        return error.InvalidCidr;
+    }
 };
 
 // ============================================================
@@ -1271,6 +1294,39 @@ test "net: IpPrefix contains v6" {
     const pfx = IpPrefix{ .addr = .{ .v6 = .{ 0x20, 0x01, 0x0d, 0xb8, 0,0,0,0,0,0,0,0,0,0,0,0 } }, .bits = 32 };
     try testing.expect(pfx.contains(.{ .v6 = .{ 0x20, 0x01, 0x0d, 0xb8, 0,0,0,1,0,0,0,0,0,0,0,0 } }));
     try testing.expect(!pfx.contains(.{ .v6 = .{ 0x20, 0x01, 0x0d, 0xb9, 0,0,0,0,0,0,0,0,0,0,0,0 } }));
+}
+
+test "net: IpPrefix.parse valid v4" {
+    const pfx = try IpPrefix.parse("10.0.0.1/24");
+    try testing.expect(pfx.addr == .v4);
+    try testing.expectEqual(@as(u8, 24), pfx.bits);
+    try testing.expect(pfx.addr.v4[0] == 10);
+}
+
+test "net: IpPrefix.parse valid v6" {
+    const pfx = try IpPrefix.parse("fe80::1/64");
+    try testing.expect(pfx.addr == .v6);
+    try testing.expectEqual(@as(u8, 64), pfx.bits);
+}
+
+test "net: IpPrefix.parse rejects missing slash" {
+    try testing.expectError(error.InvalidCidr, IpPrefix.parse("10.0.0.1"));
+}
+
+test "net: IpPrefix.parse rejects invalid bits" {
+    try testing.expectError(error.InvalidCidr, IpPrefix.parse("10.0.0.1/33"));
+    try testing.expectError(error.InvalidCidr, IpPrefix.parse("fe80::1/129"));
+}
+
+test "net: IpPrefix.parse rejects invalid IP" {
+    try testing.expectError(error.InvalidCidr, IpPrefix.parse("not-an-ip/24"));
+}
+
+test "net: IpPrefix.parse /0 and /32 boundary" {
+    const pfx0 = try IpPrefix.parse("0.0.0.0/0");
+    try testing.expectEqual(@as(u8, 0), pfx0.bits);
+    const pfx32 = try IpPrefix.parse("1.2.3.4/32");
+    try testing.expectEqual(@as(u8, 32), pfx32.bits);
 }
 
 test "net: Cidr parse v4 and v6" {
