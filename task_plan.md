@@ -1,10 +1,10 @@
 # Task Plan: zigfoundation — fixnet 生态基础库实现
 
 ## Goal
-从 zigproxy/zproxy/zigtun 提取公共组件，实现 16 个工业级基础模块（buffer/ring/endian/platform/net/strings/cli/log/yaml/store/event/queue/egress/memconn/fdconn/relay），100% 单元测试覆盖，五平台支持。
+从 zigproxy/zproxy/zigtun 提取公共组件，实现 17 个工业级基础模块（buffer/ring/endian/platform/net/strings/cli/log/yaml/store/event/queue/egress/memconn/fdconn/tunconn/relay），100% 单元测试覆盖，五平台支持。
 
 ## Current Phase
-全部 11 个 Phase 完成 — 16 模块 / 239 tests / v0.1.8 / 五平台验证通过
+全部 11 个 Phase 完成 — 17 模块 / 272 tests / v0.1.9 / 五平台验证通过
 
 ## Phases
 
@@ -206,6 +206,16 @@
 - [x] `fdconn.zig` — 将 FdStream 从 relay.zig 独立为 fdconn.zig，避免循环依赖（2 tests）
 - [x] foundation.zig + API.md 更新：16 模块、239 tests
 - [x] 回归: `zig build test` 239/239 ✅ + `zig fmt --check` ✅
+- **Status:** complete
+
+### Phase 10b: tunconn.zig TUN 连接 vtable 接口 + zigproxy 解耦 (2026-07-21)
+
+- [x] `tunconn.zig` — 从 zigtun 提取 6 个 vtable 接口类型：TcpConn/UdpConn/Handler/DirectRouteContext/DirectRouteDestination/NetworkType（274 行，零 TUN 内部逻辑）
+- [x] 架构解耦：zigproxy → zigtun 依赖断开，改为 zigproxy → zigfoundation.tunconn
+- [x] zigtun 重导出：`pub const TcpConn = zf_conn.TcpConn` 等 6 个类型，保持 API 向后兼容
+- [x] 重命名：conn.zig → tunconn.zig，公开路径 zf.conn → zf.tunconn
+- [x] 22 tests 全覆盖（6 个 vtable 类型 + mock 验证），272 tests 全绿
+- [x] 回归: `zig build test` 272/272 ✅ + zigbox 55/55 ✅
 - **Status:** complete
 
 ### Phase 11: 五平台 VM 真机测试 (2026-07-20)

@@ -17,8 +17,8 @@
 const foundation = @This();
 
 // ---- 版本信息 ----
-pub const version = "0.1.8";
-pub const version_str = "zigfoundation 0.1.8";
+pub const version = "0.1.9";
+pub const version_str = "zigfoundation 0.1.9";
 
 // ---- Phase 1: 内存管理 (std only) ----
 pub const buffer = @import("buffer.zig");
@@ -46,9 +46,10 @@ pub const queue = @import("queue.zig");
 // ---- Phase 5: 网络出站 (std only) ----
 pub const egress = @import("egress.zig");
 
-// ---- Phase 8: 内存网络连接 (std + libxev) ----
+// ---- Phase 8: 连接抽象 (std + libxev) ----
 pub const memconn = @import("memconn.zig");
 pub const fdconn = @import("fdconn.zig");
+pub const tunconn = @import("tunconn.zig");
 
 // ---- Phase 9: 数据中继 (std + libxev) ----
 pub const relay = @import("relay.zig");
@@ -71,5 +72,6 @@ test {
     _ = @import("egress.zig");
     _ = @import("memconn.zig");
     _ = @import("fdconn.zig");
+    _ = @import("tunconn.zig");
     _ = @import("relay.zig");
 }

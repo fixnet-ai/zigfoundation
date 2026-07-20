@@ -23,6 +23,7 @@ fixnet 生态基础库 — 与业务无关的工业级 Zig 基础组件。
 | egress | 网络出站路由绑定 |
 | memconn | 内存网络连接（基于 libxev Completion 模型） |
 | fdconn | fd 流适配器（libxev TCP/File/Stream → 统一 Stream 接口） |
+| tunconn | TUN 连接 vtable 接口（TcpConn/UdpConn/Handler 共享契约） |
 | relay | 双向数据中继（任意两个 Stream 端点间异步对拷） |
 
 ## 构建

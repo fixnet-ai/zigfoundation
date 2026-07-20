@@ -314,3 +314,30 @@ Completion 在回调触发前释放 = use-after-free。
 - foundation.zig 新增 `pub const fdconn` 导出
 - 模块数: 15 → 16，测试数: 237 → 239
 - API.md 新增 fdconn.zig 完整文档章节
+
+### tunconn.zig TUN vtable 接口提取 — 组件解耦 (2026-07-21)
+
+**问题**: zigproxy 编译期依赖 zigtun（`zigproxy_module.addImport("zigtun", ...)`），但实际只使用 6 个纯 vtable 接口类型（零实现逻辑）。组件库之间不应有直接依赖，应由 zigbox 统筹编排。
+
+**决策**: 将 6 个 vtable 类型从 zigtun 提取到 zigfoundation 作为共享接口层（新建 `src/tunconn.zig`）。zigtun 和 zigproxy 均改为 `@import("zigfoundation").tunconn`，zigbox 在运行时注入实现。
+
+**目标架构**:
+```
+zigfoundation.tunconn  ← 共享 vtable 接口
+    ↑                    ↑
+zigtun (重导出)    zigproxy (直接使用)
+    ↑                    ↑
+zigbox (编排层，连接两者)
+```
+
+**实施**:
+- 新建 `src/tunconn.zig`（274 行，含 22 tests）
+- zigtun/tun.zig: 6 个 `pub const Xxx = zf_conn.Xxx` 重导出
+- zigproxy 3 文件: `@import("zigfoundation").tunconn`
+- zigbox 2 文件: `zf.tunconn.Xxx`
+- zigproxy/build.zig: 删除 zigtun_module 和 addImport
+- zigbox/build.zig: 删除 `zigproxy_module.addImport("zigtun", ...)`
+
+**命名决策**: `conn.zig` → `tunconn.zig`，因为其中的类型（TcpConn/UdpConn/Handler/DirectRoute*）都是 TUN 连接层特化的，与 `fdconn`（fd 适配器）和 `memconn`（内存实现）语义区分。
+
+**验证**: zigfoundation 272/272 ✅、zigbox 55/55 ✅，zigproxy 不再依赖 zigtun

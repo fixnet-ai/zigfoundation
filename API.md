@@ -1066,6 +1066,91 @@ try relay.relay(allocator, &loop, conn, mem_stream, .{}, void, null, onDone);
 
 ---
 
+### tunconn.zig — TUN 连接 vtable 接口
+
+> **Phase 8** | std only | 新建
+
+TUN 协议栈与代理组件间的共享 vtable 接口契约。所有类型均为纯 `{ ptr: *anyopaque, vtable: *const VTable }` 结构，零平台/零 TUN 内部逻辑。
+
+**设计原则**：zigtun/zigproxy/zigbox 编译期互不依赖，通过 zigfoundation.tunconn 的共享 vtable 接口解耦。zigbox 在运行时注入实现，统筹各组件。
+
+#### 类型概览
+
+| 类型 | 角色 | vtable 方法 |
+|------|------|-------------|
+| `NetworkType` | 网络层协议标签 | `tcp / udp / icmp` (enum) |
+| `TcpConn` | TCP 连接抽象 | read / write / close / localAddr / remoteAddr / fd |
+| `UdpConn` | UDP 连接抽象 | readFrom / writeTo / close / localAddr / fd |
+| `Handler` | TUN 入站回调 | prepareConnection / newConnection / newPacketConnection / protect |
+| `DirectRouteContext` | 直连路由写入上下文 | writePacket |
+| `DirectRouteDestination` | 直连路由目标 | writePacket / close / isClosed |
+
+#### API
+
+##### TcpConn
+
+| 方法 | 签名 | 描述 |
+|------|------|------|
+| `read` | `fn (self, buf: []u8) anyerror!usize` | 从连接读取数据 |
+| `write` | `fn (self, data: []const u8) anyerror!usize` | 向连接写入数据 |
+| `close` | `fn (self) void` | 关闭连接 |
+| `localAddr` | `fn (self) SocksAddr` | 本地地址 |
+| `remoteAddr` | `fn (self) SocksAddr` | 远端地址 |
+| `fd` | `fn (self) ?std.posix.socket_t` | 底层 fd（lwIP 返回 null） |
+
+##### UdpConn
+
+| 方法 | 签名 | 描述 |
+|------|------|------|
+| `readFrom` | `fn (self, buf: []u8) anyerror!ReadFromResult` | 读取数据包及来源地址 |
+| `writeTo` | `fn (self, data: []const u8, addr: SocksAddr) anyerror!usize` | 向指定地址发送数据包 |
+| `close` | `fn (self) void` | 关闭连接 |
+| `localAddr` | `fn (self) SocksAddr` | 本地地址 |
+| `fd` | `fn (self) ?std.posix.socket_t` | 底层 fd |
+
+##### Handler
+
+| 方法 | 签名 | 描述 |
+|------|------|------|
+| `prepareConnection` | `fn (self, network, src, dst, route_ctx, timeout_ms) anyerror!DirectRouteDestination` | 连接建立前的路由决策 |
+| `newConnection` | `fn (self, conn: TcpConn, src, dst) anyerror!void` | 新 TCP 连接回调 |
+| `newPacketConnection` | `fn (self, conn: UdpConn, src, dst) anyerror!void` | 新 UDP 包回调 |
+| `protect` | `fn (self, fd: socket_t) anyerror!void` | Android VPN 保护（桌面平台空实现） |
+
+#### 使用示例
+
+```zig
+const zf = @import("zigfoundation");
+
+// 实现 Handler vtable（zigbox 侧）
+pub fn toHandler(self: *ZigboxHandler) zf.tunconn.Handler {
+    return .{
+        .ptr = self,
+        .vtable = &.{
+            .prepareConnectionFn = prepareConnectionFn,
+            .newConnectionFn = newConnectionFn,
+            .newPacketConnectionFn = newPacketConnectionFn,
+            .protectFn = protectFn,
+        },
+    };
+}
+
+// 消费 TcpConn（出站侧）
+pub fn connectTcp(self: *DirectOutbound, tun_conn: zf.tunconn.TcpConn, ...) !void {
+    // tun_conn.read / tun_conn.write / tun_conn.close
+}
+```
+
+#### DirectRouteContext.none 哨兵
+
+无需直连路由时使用 `.none` 哨兵，避免空指针：
+
+```zig
+try handler.prepareConnection(.tcp, src, dst, zf.tunconn.DirectRouteContext.none, 5000);
+```
+
+---
+
 ### relay.zig — 双向数据中继
 
 > **Phase 9** | std + libxev | 新建
@@ -1450,6 +1535,7 @@ adb shell /data/local/tmp/zigfoundation-android-test
 
 | 版本 | 日期 | 变更 |
 |------|------|------|
+| 0.1.9 | 2026-07-21 | tunconn.zig TUN 连接 vtable 接口模块：从 zigtun 提取 6 个 vtable 类型（TcpConn/UdpConn/Handler/DirectRouteContext/DirectRouteDestination/NetworkType）到 zigfoundation，解耦 zigproxy → zigtun 依赖；conn.zig 重命名为 tunconn.zig；22 tests 全覆盖；272 tests 全绿 |
 | 0.1.8 | 2026-07-20 | fdconn.zig 独立模块：将 FdStream 从 relay.zig 提取到 fdconn.zig，避免多模块引用时的循环依赖；239 tests 全绿 |
 | 0.1.7 | 2026-07-20 | Phase 9: relay.zig 异步双向数据中继模块（FdStream 适配器、RelayCtx Completion 链、4 tests）；memconn.close() 改为同步完成（修复与 pending read 在 self_read_async 上的 kqueue 冲突） |
 | 0.1.6 | 2026-07-20 | 零拷贝优化：RingBuf pushSlice/popSlice 用 `@memcpy` 批量拷贝（LLVM 自动向量化）；RingBuf 新增零拷贝 span API (writeSpan/commitWrite/readSpan/commitRead)；memconn 新增零拷贝 Completion (readDirect/writeDirect) 消除中间内存拷贝 |

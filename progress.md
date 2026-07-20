@@ -1,5 +1,18 @@
 # Progress Log
 
+## 2026-07-21: tunconn.zig TUN 连接 vtable 接口 + zigproxy 解耦
+
+- 新建 `src/tunconn.zig`（从 zigtun 提取，原 `conn.zig`）
+- 提取 6 个 vtable 接口类型：TcpConn / UdpConn / Handler / DirectRouteContext / DirectRouteDestination / NetworkType
+- 解耦 zigproxy → zigtun 依赖：zigproxy/build.zig 删除 zigtun_module，3 文件改为 `@import("zigfoundation").tunconn`
+- zigtun 重导出 6 个类型保持 API 兼容
+- conn.zig → tunconn.zig 重命名：公开路径 zf.conn → zf.tunconn
+- 22 tests 全覆盖（mock 实现验证所有 vtable dispatch），272 tests 全绿
+- zigbox 55/55 tests 通过
+- 版本升级 0.1.8 → 0.1.9
+- API.md 新增 tunconn.zig 完整文档章节
+- README.md 模块表新增 tunconn
+
 ## 2026-07-20: fdconn.zig 独立模块 — FdStream 提取
 
 - 将 `FdStream` 从 `src/relay.zig` 移出到新建 `src/fdconn.zig`
