@@ -279,6 +279,24 @@ std + libxev (6):  store  event  queue  memconn  fdconn  relay
 4. 原项目改为 `const foundation = @import("zigfoundation");` 并更新调用点
 5. 提取后原项目的测试保留（验证行为不变），zigfoundation 新增独立测试
 
+### 唯一实现源原则（核心架构约束）
+
+**zigfoundation 是所有底层算法和基础类型的唯一实现源。** 此原则适用于：
+
+| 类别 | 模块 | 禁止在其他项目中重复实现 |
+|------|------|------------------------|
+| 信号处理 | `signal.zig` | `sigaction`/`SetConsoleCtrlHandler`/`waitForSignal`/`exitRequested` |
+| 字节序 | `endian.zig` | `std.mem.readInt`/`writeInt` 的包装函数 |
+| 平台抽象 | `platform.zig` | `monoMillis`/`monoMicros`/平台检测/`sleepMs` |
+| 网络类型 | `net.zig` | `Cidr`/`Cidr4`/`Cidr6`/`PortRange`/`IpAddr`/`IpPrefix`/`SocksAddr`/`isNonPublicV4`/`isNonPublicV6` |
+| 内存管理 | `buffer.zig`/`ring.zig` | `BufferPool`/`RingBuf` |
+| 日志 | `log.zig` | `logOptions`/日志格式化/跨平台输出 |
+
+**规则：**
+- 如果功能已在 zigfoundation 中存在，其他项目**必须**通过 `@import("zigfoundation")` 使用，**严禁**重新实现
+- 如需新增基础功能，先评估是否应放入 zigfoundation，而非在消费项目中局部添加
+- cli.zig 的信号处理已委托到 signal.zig（2026-07 重构），不得反向复制
+
 ## 行为准则
 
 **先思考再编码。不要假设。简单优先。精准变更。目标驱动执行。**
