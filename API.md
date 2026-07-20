@@ -1,8 +1,8 @@
 # zigfoundation API 参考
 
-> **状态**: 16 模块全部实现，239 tests 全绿
+> **状态**: 16 模块全部实现，279 tests 全绿
 >
-> 版本: 0.1.8 | 目标平台: Windows / macOS / Linux / iOS / Android
+> 版本: 0.1.10 | 目标平台: Windows / macOS / Linux / iOS / Android
 >
 > 依赖: Zig std + zli + libyaml C 库 + libxev | 构建: Zig 0.16.0
 
@@ -300,6 +300,21 @@ pub const Cidr6 = struct {
 | `next` | `fn (self) Ip6Addr` | 下一个子网起始地址 |
 | `format` | `fn (self, buf: *[max_ipv6_buf]u8) ![]const u8` | 格式化为标准 CIDR 表示 |
 
+#### IpPrefix — 通用 IP 前缀
+
+```zig
+pub const IpPrefix = struct {
+    addr: IpAddr,    // IP 地址（v4 或 v6）
+    bits: u8,        // 前缀长度 (0-32 或 0-128)
+};
+```
+
+| 方法 | 签名 | 描述 |
+|------|------|------|
+| `parse` | `fn (s: []const u8) !IpPrefix` | 解析 CIDR 字符串（如 "10.0.0.1/24" 或 "fe80::1/64"），自动识别 IPv4/IPv6 |
+| `contains` | `fn (self, a: IpAddr) bool` | 检查 IP 是否在此前缀范围内 |
+| `masked` | `fn (self) IpAddr` | 返回网络地址（主机位清零） |
+
 ---
 
 ### strings.zig — 字符串处理
@@ -406,6 +421,7 @@ pub const Level = std.log.Level;   // .err | .warn | .info | .debug
 | `setLevel` | `fn (level: Level) void` | 运行时动态切换级别 |
 | `getLevel` | `fn () Level` | 获取当前级别 |
 | `logOptions` | `fn () std.Options` | 返回带自定义 logFn 的 std.Options |
+| `parseLevel` | `fn (s: []const u8) Level` | 从字符串解析日志级别。"trace"/"debug"→.debug, "info"→.info, "warn"→.warn, "err"→.err。未识别默认返回 .info |
 
 **使用方式** — 在应用根文件中：
 
@@ -625,6 +641,24 @@ const sock = try foundation.egress.Socket.initTcp(.{
 });
 defer sock.close();
 ```
+
+#### 默认网卡检测 API
+
+| 方法 | 签名 | 描述 |
+|------|------|------|
+| `getDefaultInterfaceIndex` | `fn () ?u32` | 检测默认物理网卡索引，通过路由表查找默认网关的实际接口。macOS: `route -n get default` / Linux: `/proc/net/route` / Windows: `GetBestInterface`。所有方法失败后 fallback 到候选名列表，无结果返回 null |
+| `ifNameToIndex` | `fn (name: []const u8) ?u32` | 网卡名转索引，失败返回 null |
+
+**使用场景**：TUN 模式下出站 socket 需要绑定到物理网卡以绕过 TUN 路由循环。
+
+```zig
+if (foundation.egress.getDefaultInterfaceIndex()) |idx| {
+    const sock = try foundation.egress.Socket.initTcp(.{ .interface_index = idx });
+    defer sock.close();
+}
+```
+
+---
 
 ### memconn.zig — 内存网络连接
 
@@ -1535,6 +1569,7 @@ adb shell /data/local/tmp/zigfoundation-android-test
 
 | 版本 | 日期 | 变更 |
 |------|------|------|
+| 0.1.10 | 2026-07-21 | 新 API：egress.getDefaultInterfaceIndex()（跨平台默认网卡检测）/ egress.ifNameToIndex() / log.parseLevel()（日志级别字符串解析）/ net.IpPrefix.parse()（CIDR 字符串解析）；279 tests 全绿 |
 | 0.1.9 | 2026-07-21 | tunconn.zig TUN 连接 vtable 接口模块：从 zigtun 提取 6 个 vtable 类型（TcpConn/UdpConn/Handler/DirectRouteContext/DirectRouteDestination/NetworkType）到 zigfoundation，解耦 zigproxy → zigtun 依赖；conn.zig 重命名为 tunconn.zig；22 tests 全覆盖；272 tests 全绿 |
 | 0.1.8 | 2026-07-20 | fdconn.zig 独立模块：将 FdStream 从 relay.zig 提取到 fdconn.zig，避免多模块引用时的循环依赖；239 tests 全绿 |
 | 0.1.7 | 2026-07-20 | Phase 9: relay.zig 异步双向数据中继模块（FdStream 适配器、RelayCtx Completion 链、4 tests）；memconn.close() 改为同步完成（修复与 pending read 在 self_read_async 上的 kqueue 冲突） |

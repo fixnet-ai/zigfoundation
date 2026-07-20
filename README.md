@@ -12,15 +12,15 @@ fixnet 生态基础库 — 与业务无关的工业级 Zig 基础组件。
 | ring | SPSC 无锁环缓冲区 |
 | endian | 大小端读写统一 API |
 | platform | 平台抽象（CPU/内存/DNS/时间） |
-| net | IP 格式化/解析、CIDR、域名判断 |
+| net | IP 格式化/解析、CIDR、IpPrefix、域名判断 |
 | strings | 大小写转换、子串搜索、前后缀匹配 |
 | cli | 命令行框架（zli + 信号处理 + 守护进程化） |
-| log | 跨平台日志（Android logcat / iOS syslog / 桌面 stderr） |
+| log | 跨平台日志（Android logcat / iOS syslog / 桌面 stderr）+ 级别解析 |
 | yaml | YAML 解析（libyaml 封装） |
 | store | 持久化 KV 存储（文件系统） |
 | event | 跨平台事件通知（pthread / SRWLOCK） |
 | queue | MPSC 有界队列 |
-| egress | 网络出站路由绑定 |
+| egress | 网络出站路由绑定 + 默认网卡检测 |
 | memconn | 内存网络连接（基于 libxev Completion 模型） |
 | fdconn | fd 流适配器（libxev TCP/File/Stream → 统一 Stream 接口） |
 | tunconn | TUN 连接 vtable 接口（TcpConn/UdpConn/Handler 共享契约） |
