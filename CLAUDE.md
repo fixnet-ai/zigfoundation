@@ -240,10 +240,58 @@ std + libxev (6):  store  event  queue  memconn  fdconn  relay
 
 ### 日志规范
 
-- 日志通过 `std.log` 统一接口输出（`std.log.info`、`std.log.err` 等）
-- 在应用程序根文件中设置 `pub const std_options: std.Options = log.logOptions();` 覆盖全局日志
-- 日志级别仅四级：`err` > `warn` > `info` > `debug`（Zig 0.16.0 std.log.Level）
-- 运行时通过 `log.init(level)` 初始化、`log.setLevel(level)` 动态切换
+所有代码必须遵循统一的日志格式。zigfoundation 的 `log.zig` 是日志基础设施的**唯一实现源**。
+
+**级别定义：**
+
+| 级别 | 用途 | 语义 |
+|------|------|------|
+| `err` | 致命错误、不可恢复 | 初始化失败、资源耗尽、系统调用错误 |
+| `warn` | 可恢复异常、降级行为 | 超时、重试、非预期但可处理 |
+| `info` | 关键生命周期事件 | 启动/关闭、连接建立/关闭 |
+| `debug` | 调测细节 | 内部状态追踪、数据流详情 |
+
+**消息格式：** `[component] action: key=value key2=value2`
+
+- `[component]` — 模块短标识，方括号包裹
+- `action` — 英文小写动词短语
+- `key=value` — 结构化字段，空格分隔
+
+**示例：**
+```
+[buffer] pool created: capacity=64 buf_size=8192
+[ring] write blocked: available=0 capacity=1024
+[net] cidr parsed: input=10.0.0.0/8 version=v4
+[signal] shutdown requested: signal=SIGTERM
+[egress] bind failed: interface=eth0 error=NoSuchDevice
+[warn] [relay] idle timeout: src=10.0.0.1:44321 duration_ms=300000
+[err] [platform] clock init failed: error=Unexpected
+[debug] [buffer] shrink check: used=3 initial=16 threshold=8
+```
+
+**初始化（仅应用层）：**
+
+```zig
+// 应用程序根文件 — 库项目不设此
+pub const std_options = foundation.log.logOptions();
+
+pub fn main() !void {
+    foundation.log.init(.info);
+    // ...
+}
+```
+
+库项目不调用 `log.init()`，由上层应用统一初始化。库代码直接使用 `std.log.info` 等接口。
+
+**禁止事项：**
+
+| # | 规则 | 原因 |
+|---|------|------|
+| 1 | 禁止在热路径打印 | `read`/`write` 循环内不得有日志 |
+| 2 | 禁止打印敏感数据 | 密码/token 绝不出现 |
+| 3 | 禁止裸 `std.debug.print` | 必须走 `std.log.err/warn/info/debug` |
+| 4 | 禁止无 `[component]` 前缀 | 每条日志必须以 `[module]` 开头 |
+| 5 | 禁止 `info` 级别高频事件 | 细粒度调测用 `debug`
 
 ### CLI 规范
 
