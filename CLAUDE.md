@@ -242,6 +242,14 @@ std + libxev (6):  store  event  queue  memconn  fdconn  relay
 
 所有代码必须遵循统一的日志格式。zigfoundation 的 `log.zig` 是日志基础设施的**唯一实现源**。
 
+**强制要求：所有日志输出必须通过 `log.zig` 基础设施，严禁绕过。**
+
+| ✅ 允许 | ❌ 禁止 |
+|--------|--------|
+| `std.log.info("[buffer] ...")` — 通过 `log.logOptions()` 设置 `std_options` 后使用 | 裸 `std.debug.print(...)` |
+| `std.log.err("[net] ...")` — 同上 | 直接 `std.log.info(...)` 而不设置 `log.logOptions()` |
+| | `std.io.getStdErr().writeAll(...)` 或其他任何绕过方式 |
+
 **级别定义：**
 
 | 级别 | 用途 | 语义 |
