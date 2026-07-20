@@ -13,7 +13,7 @@
 ### 项目现状 (2026-07-18)
 - 仓库：https://github.com/fixnet-ai/zigfoundation（已推送）
 - 构建系统：build.zig（静态库 + test/test-build 目标）、build.zig.zon
-- 入口模块：src/foundation.zig（barrel 模块，版本 0.1.0，子模块 import 已预留）
+- 入口模块：src/mod.zig（barrel 模块，子模块 import 已预留）
 - 文档：CLAUDE.md、API.md、zig-codegen.md（合并自 zigtun/zigproxy/zproxy）
 - Git 环境：.gitignore、.gitattributes、user.name=fixnet-ai、user.email=noreply
 - Skills：.claude/skills/zig（目录）、utm-vm（软链接 → ../../../utm-monitor/utm-vm）

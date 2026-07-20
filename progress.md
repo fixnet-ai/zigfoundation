@@ -1,5 +1,11 @@
 # Progress Log
 
+## 2026-07-21: foundation.zig → mod.zig 重命名
+
+- `src/foundation.zig` 重命名为 `src/mod.zig`，与其他库（zigtun/zigdns/zigproxy）统一
+- build.zig: `root_source_file` 路径更新
+- 对外接口 (`@import("zigfoundation")`) 不变，其他项目无需修改
+
 ## 2026-07-21: tunconn.zig TUN 连接 vtable 接口 + zigproxy 解耦
 
 - 新建 `src/tunconn.zig`（从 zigtun 提取，原 `conn.zig`）
