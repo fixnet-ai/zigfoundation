@@ -1,8 +1,8 @@
 # zigfoundation API 参考
 
-> **状态**: 16 模块全部实现，279 tests 全绿
+> **状态**: 16 模块全部实现，293 tests 全绿
 >
-> 版本: 0.1.10 | 目标平台: Windows / macOS / Linux / iOS / Android
+> 版本: 0.1.11 | 目标平台: Windows / macOS / Linux / iOS / Android
 >
 > 依赖: Zig std + zli + libyaml C 库 + libxev | 构建: Zig 0.16.0
 
@@ -257,7 +257,8 @@ pub const Ip6Addr = [16]u8;  // IPv6 地址（网络字节序，大端）
 
 | 函数 | 签名 | 描述 |
 |------|------|------|
-| `parseHostPort` | `fn (host_port: []const u8) !struct { host: []const u8, port: u16 }` | 解析 "host:port" 字符串 |
+| `parseHostPort` | `fn (host_port: []const u8) !struct { host: []const u8, port: u16 }` | 拆分 "host:port" 为 host + port |
+| `parseHostPortAddr` | `fn (host_port: []const u8, default_port: u16) !std.Io.net.IpAddress` | 解析 "host:port" 为 `IpAddress`，正确区分 IPv4/v6 |
 | `buildHostPort` | `fn (host: []const u8, port: u16, buf: *[max_host_port_len]u8) ![]const u8` | 构造 "host:port" 字符串 |
 
 #### Cidr4 — IPv4 CIDR
@@ -314,6 +315,33 @@ pub const IpPrefix = struct {
 | `parse` | `fn (s: []const u8) !IpPrefix` | 解析 CIDR 字符串（如 "10.0.0.1/24" 或 "fe80::1/64"），自动识别 IPv4/IPv6 |
 | `contains` | `fn (self, a: IpAddr) bool` | 检查 IP 是否在此前缀范围内 |
 | `masked` | `fn (self) IpAddr` | 返回网络地址（主机位清零） |
+
+#### 使用示例
+
+```zig
+const zf = @import("zigfoundation");
+
+// parseHostPortAddr — 正确解析 "host:port"，区分 IPv4/IPv6
+const ip = try zf.net.parseHostPortAddr("10.0.0.1:53", 53);
+// → IpAddress{ .ip4 = { .bytes = {10,0,0,1}, .port = 53 } }
+
+// IPv6 方括号格式
+const ip6 = try zf.net.parseHostPortAddr("[::1]:5353", 0);
+// → IpAddress{ .ip6 = { .bytes = {0,...,1}, .port = 5353 } }
+
+// 纯 IPv6 字面量（多冒号，无端口）
+const ip6b = try zf.net.parseHostPortAddr("::1", 53);
+// → IpAddress{ .ip6 = { .bytes = {0,...,1}, .port = 53 } }
+
+// 纯 IPv4（零冒号，使用默认端口）
+const ip4 = try zf.net.parseHostPortAddr("192.168.1.1", 8080);
+// → IpAddress{ .ip4 = { .bytes = {192,168,1,1}, .port = 8080 } }
+```
+
+> **为什么不用 `std.Io.net.IpAddress.parse`？**  
+> Zig std lib 的 `Ip4Address.parse` 不处理 `:` 端口分隔符。  
+> `"10.0.0.1:53"` 中的冒号会被 `IpAddress.parse` 误判为 IPv6 地址导致 `ParseFailed`。  
+> `parseHostPortAddr` 通过冒号计数 + 拆分 host/port 正确解决此问题。
 
 ---
 

@@ -366,3 +366,24 @@ zigbox (编排层，连接两者)
 - `checkShrink(now_ms, idle_timeout_ms) u32`：外部定时器周期性调用，空闲超时后收缩到初始容量
 
 **验证**: zigfoundation 287 tests ✅（buffer 测试 8→14 项）
+
+## Zig 0.16.0 IpAddress.parse 冒号陷阱 (2026-07-21)
+
+**问题**: `std.Io.net.IpAddress.parse("10.0.0.1:53", 53)` 返回 `ParseFailed`。
+
+**根因**: `Ip4Address.parse` 逐字符解析，`:` 触发 `error.InvalidCharacter`。
+`IpAddress.parse` 在 IPv4 失败后尝试 IPv6，`"10.0.0.1:53"` 不是有效 IPv6 格式 → 最终 `ParseFailed`。
+
+**设计本意**: Zig std lib 的 `parse(text, port)` 期望 `text` 不含端口（端口通过第二个参数传入）。
+`format()` 输出 `"1.2.3.4:port"` 格式，但 `parse()` **不**支持相同格式的输入。
+
+**方案**: zigfoundation `net.parseHostPortAddr`：
+1. 方括号 `[ipv6]:port` → parseHostPort 拆分 → IPv6 解析
+2. 多个 `:` → 纯 IPv6 字面量 → 直接解析 + default_port
+3. 单个 `:` → parseHostPort 拆分 host:port → 先 IPv4 后 IPv6
+4. 零 `:` → 纯 IP + default_port
+
+**影响范围**: zigdns `DnsServer.init` 已迁移至 `zf.net.parseHostPortAddr`。
+任何调用 `std.Io.net.IpAddress.parse(host_port_str, default_port)` 的地方都可能受影响。
+
+**验证**: zigfoundation 293 tests ✅

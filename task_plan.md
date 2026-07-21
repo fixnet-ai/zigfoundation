@@ -4,7 +4,7 @@
 从 zigproxy/zproxy/zigtun 提取公共组件，实现 17 个工业级基础模块（buffer/ring/endian/platform/net/strings/cli/log/yaml/store/event/queue/egress/memconn/fdconn/tunconn/relay），100% 单元测试覆盖，五平台支持。
 
 ## Current Phase
-全部 11 个 Phase 完成 — 17 模块 / 287 tests / v0.1.10 / 五平台验证通过
+全部 11 个 Phase 完成 — 17 模块 / 293 tests / v0.1.11 / 五平台验证通过
 
 ## Phases
 
@@ -281,4 +281,4 @@
 - `pool2K()` / `pool4K()` 工厂函数（UDP 数据报 / 握手协议专用）
 - `idle_since_ms` 字段 + `checkShrink()` 周期性空闲收缩
 - +6 测试（pool2K/pool4K 配置、checkShrink 收缩/跳过、acquire 清除 idle）
-- 测试总数：281 → 287
+- 测试总数：287 → 293

@@ -1,5 +1,14 @@
 # Progress Log
 
+## 2026-07-21: net.parseHostPortAddr — IPv4/IPv6 host:port 解析
+
+- `net.zig` 新增 `parseHostPortAddr` 函数，正确区分 IPv4/IPv6 的 "host:port" 格式
+- 解决 Zig 0.16.0 `std.Io.net.IpAddress.parse` 将 `"10.0.0.1:53"` 误判为 IPv6 的问题
+- 冒号计数启发式：方括号 → IPv6+端口、多冒号 → 纯 IPv6、单冒号 → host:port、零冒号 → 纯 IP
+- +6 tests（IPv4+port、IPv4+默认端口、方括号 IPv6、裸 IPv6、域名 error、常见监听地址）
+- zigfoundation 293/293 ✅
+- zigdns `DnsServer.init` 已迁移至 `zf.net.parseHostPortAddr`
+
 ## 2026-07-21: foundation.zig → mod.zig 重命名
 
 - `src/foundation.zig` 重命名为 `src/mod.zig`，与其他库（zigtun/zigdns/zigproxy）统一
