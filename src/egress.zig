@@ -192,8 +192,8 @@ const winSock = struct {
     extern "ws2_32" fn closesocket(s: SOCKET) callconv(.winapi) c_int;
 };
 
-/// 应用 BindOpts 到 socket fd。
-fn applyOpts(fd: std.posix.socket_t, opts: BindOpts, is_ipv6: bool) !void {
+/// 应用 BindOpts 到已有 socket fd（公开接口，供 zigdns/zigproxy 等库使用）。
+pub fn applyOpts(fd: std.posix.socket_t, opts: BindOpts, is_ipv6: bool) !void {
     if (opts.reuse_addr) {
         try setReuseAddr(fd);
     }
@@ -266,12 +266,17 @@ fn bindSourceAddr(fd: std.posix.socket_t, addr_str: []const u8) !void {
     const port_str = addr_str[colon_idx + 1 ..];
     const port = std.fmt.parseInt(u16, port_str, 10) catch return error.InvalidAddress;
 
+    std.log.debug("[egress] bindSourceAddr: ip_str={s} port={d}", .{ ip_str, port });
+
     // 构造通用 sockaddr 结构（兼容 macOS sin_len / Linux 无 sin_len）
     var sa_bytes: [28]u8 = [_]u8{0} ** 28;
     var sa_len: u32 = 0;
 
     // 尝试解析为 IPv4
-    const ip4 = std.Io.net.Ip4Address.parse(ip_str, port) catch null;
+    const ip4 = std.Io.net.Ip4Address.parse(ip_str, port) catch |err4| blk: {
+        std.log.debug("[egress] Ip4Address.parse failed: ip_str={s} err={s}", .{ ip_str, @errorName(err4) });
+        break :blk null;
+    };
     if (ip4) |v| {
         const addr: u32 = @as(u32, v.bytes[0]) << 24 |
             @as(u32, v.bytes[1]) << 16 |
@@ -290,7 +295,10 @@ fn bindSourceAddr(fd: std.posix.socket_t, addr_str: []const u8) !void {
             sa_len = @sizeOf(SockAddrIn4);
         }
     } else {
-        const ip6 = std.Io.net.Ip6Address.parse(ip_str, port) catch null;
+        const ip6 = std.Io.net.Ip6Address.parse(ip_str, port) catch |err6| blk: {
+            std.log.debug("[egress] Ip6Address.parse failed: ip_str={s} err={s}", .{ ip_str, @errorName(err6) });
+            break :blk null;
+        };
         if (ip6) |v6| {
             if (builtin.os.tag.isDarwin()) {
                 sa_bytes[0] = @sizeOf(SockAddrIn6); // sin6_len
@@ -541,6 +549,81 @@ fn getDefaultInterfaceIndexFallback() ?u32 {
         }
     }
     std.log.warn("[egress] no default interface detected, outbound sockets will not bypass TUN", .{});
+    return null;
+}
+
+// ============================================================================
+// 默认网卡地址检测
+// ============================================================================
+
+/// getifaddrs 链表节点（跨平台：macOS/Linux）。
+const IfAddrs = extern struct {
+    ifa_next: ?*IfAddrs,
+    ifa_name: [*:0]u8,
+    ifa_flags: c_uint,
+    ifa_addr: ?*std.c.sockaddr,
+    ifa_netmask: ?*std.c.sockaddr,
+    ifa_dstaddr: ?*std.c.sockaddr,
+    ifa_data: ?*anyopaque,
+};
+
+extern "c" fn getifaddrs(ifap: *?*IfAddrs) c_int;
+extern "c" fn freeifaddrs(ifa: ?*IfAddrs) void;
+extern "c" fn if_indextoname(ifindex: c_uint, ifname: [*]u8) ?[*:0]u8;
+
+/// 将网卡索引转为名称（跨平台：macOS/Linux）。
+fn ifIndexToNameBuf(idx: u32, buf: *[16]u8) ?[]const u8 {
+    const ptr = if_indextoname(idx, buf);
+    if (ptr == null) return null;
+    return std.mem.sliceTo(ptr, 0);
+}
+
+/// 检测默认物理网卡的 IPv4 地址，写入调用者提供的缓冲区。
+/// 返回写入 buf 的切片，失败返回 null。
+/// 配合 IP_BOUND_IF 使用，bind() 到出口 IP 绕过 TUN 路由循环。
+pub fn getDefaultInterfaceAddr(buf: []u8) ?[]const u8 {
+    const idx = getDefaultInterfaceIndex() orelse return null;
+
+    var name_buf: [16]u8 = [_]u8{0} ** 16;
+    const if_name = ifIndexToNameBuf(idx, &name_buf) orelse {
+        std.log.warn("[egress] if_indextoname({d}) failed", .{idx});
+        return null;
+    };
+
+    var ifap: ?*IfAddrs = null;
+    if (getifaddrs(&ifap) != 0) {
+        std.log.warn("[egress] getifaddrs() failed", .{});
+        return null;
+    }
+    defer freeifaddrs(ifap);
+
+    var cur = ifap;
+    while (cur) |ifa| : (cur = ifa.ifa_next) {
+        if (!std.mem.eql(u8, std.mem.span(ifa.ifa_name), if_name)) continue;
+        const addr = ifa.ifa_addr orelse continue;
+        if (addr.family != AF_INET) continue;
+
+        // sockaddr_in: sa_family(1) + port(2) + addr(4) = offset 2 for sin_addr
+        const sa_data = @as([*]const u8, @ptrCast(addr))[2..];
+        const ip_addr = sa_data[2..6]; // skip port (2 bytes)
+        const ip_int = std.mem.readInt(u32, ip_addr, .big);
+
+        // 写入调用者提供的缓冲区
+        const result = std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}", .{
+            (ip_int >> 24) & 0xff,
+            (ip_int >> 16) & 0xff,
+            (ip_int >> 8) & 0xff,
+            ip_int & 0xff,
+        }) catch {
+            std.log.warn("[egress] failed to format interface address", .{});
+            return null;
+        };
+
+        std.log.info("[egress] default interface addr: {s} ({s}, index={d})", .{ result, if_name, idx });
+        return result;
+    }
+
+    std.log.warn("[egress] no IPv4 address found for interface {s}", .{if_name});
     return null;
 }
 
