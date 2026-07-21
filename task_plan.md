@@ -4,7 +4,7 @@
 从 zigproxy/zproxy/zigtun 提取公共组件，实现 17 个工业级基础模块（buffer/ring/endian/platform/net/strings/cli/log/yaml/store/event/queue/egress/memconn/fdconn/tunconn/relay），100% 单元测试覆盖，五平台支持。
 
 ## Current Phase
-全部 11 个 Phase 完成 — 17 模块 / 272 tests / v0.1.9 / 五平台验证通过
+全部 11 个 Phase 完成 — 17 模块 / 287 tests / v0.1.10 / 五平台验证通过
 
 ## Phases
 
@@ -262,8 +262,23 @@
 | Error | Attempt | Resolution |
 |-------|---------|------------|
 
-## Notes
-- 参考代码路径见 CLAUDE.md「参考代码」章节
-- Zig 0.16.0 编码经验见 `./zig-codegen.md`
-- 测试与实现同文件（Zig 惯用模式）
-- 提取规则：保持逻辑不变 → 移除原项目 import → 用 foundation 类型替代 → 原项目保留测试、foundation 新增测试
+
+---
+
+### Phase 10: zf.relay TCP relay 支持 + 缓冲池增强 ✅ (2026-07-21)
+
+**fdconn.zig kqueue 兼容修复**：
+- macOS kqueue 后端 `xev.TCP` 无 `S.ReadError`/`S.WriteError`/`S.CloseError` 类型成员
+- 改为模块级 `xev.ReadError`/`xev.WriteError`/`xev.CloseError`
+
+**tunconn.zig `toAsyncStream()` 新增**：
+- `TcpConn.toAsyncStream()` 将 TUN TCP 连接适配为 relay 兼容 Stream
+- System Stack 提取 fd → `xev.TCP.initFd(fd)` → `fdconn.FdStream`
+- lwIP 连接无 fd，返回 `error.NoFd`
+- +2 测试（NoFd 错误、编译期类型验证）
+
+**buffer.zig 池增强**：
+- `pool2K()` / `pool4K()` 工厂函数（UDP 数据报 / 握手协议专用）
+- `idle_since_ms` 字段 + `checkShrink()` 周期性空闲收缩
+- +6 测试（pool2K/pool4K 配置、checkShrink 收缩/跳过、acquire 清除 idle）
+- 测试总数：281 → 287

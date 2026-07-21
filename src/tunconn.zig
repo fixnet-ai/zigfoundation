@@ -10,7 +10,9 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const xev = @import("xev");
 const net = @import("net.zig");
+const fdconn = @import("fdconn.zig");
 
 // ============================================================================
 // SocksAddr — re-exported from net.zig
@@ -138,6 +140,19 @@ pub const TcpConn = struct {
     pub fn fd(self: TcpConn) ?std.posix.socket_t {
         if (self.vtable.fdFn) |f| return f(self.ptr);
         return null;
+    }
+
+    /// 将 TcpConn 转换为 relay 兼容的异步 Stream（通过底层 fd 创建 xev.TCP + FdStream 包装）。
+    ///
+    /// 前提：连接必须有底层 fd（System Stack 返回有效 fd，lwIP 返回 null）。
+    /// lwIP 连接无 fd，返回 error.NoFd。
+    ///
+    /// **所有权转移**：调用成功后 fd 所有权移交给返回的 Stream，
+    /// relay 关闭时自动关闭 fd，调用者不可再调用 conn.close()。
+    pub fn toAsyncStream(self: TcpConn) !fdconn.FdStream(xev.TCP) {
+        const sock_fd = self.fd() orelse return error.NoFd;
+        const tcp = xev.TCP.initFd(sock_fd);
+        return .{ .inner = tcp };
     }
 };
 
@@ -496,6 +511,26 @@ test "tunconn: TcpConn fd 无 fdFn" {
     var mock = MockTcpConn{};
     const conn = TcpConn{ .ptr = &mock, .vtable = &vtable_no_fd };
     try testing.expectEqual(@as(?std.posix.socket_t, null), conn.fd());
+}
+
+test "tunconn: toAsyncStream 无 fd 返回 error.NoFd" {
+    const vtable_no_fd = TcpConn.VTable{
+        .readFn = MockTcpConn.readFn,
+        .writeFn = MockTcpConn.writeFn,
+        .closeFn = MockTcpConn.closeFn,
+        .localAddrFn = MockTcpConn.localAddrFn,
+        .remoteAddrFn = MockTcpConn.remoteAddrFn,
+        .fdFn = null,
+    };
+    var mock = MockTcpConn{};
+    const conn = TcpConn{ .ptr = &mock, .vtable = &vtable_no_fd };
+    try testing.expectError(error.NoFd, conn.toAsyncStream());
+}
+
+test "tunconn: toAsyncStream 返回类型满足 FdStream(xev.TCP) 编译期验证" {
+    const S = fdconn.FdStream(xev.TCP);
+    testing.refAllDecls(S);
+    try testing.expect(true);
 }
 
 // ---- UdpConn mock ----

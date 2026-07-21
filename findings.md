@@ -341,3 +341,28 @@ zigbox (编排层，连接两者)
 **命名决策**: `conn.zig` → `tunconn.zig`，因为其中的类型（TcpConn/UdpConn/Handler/DirectRoute*）都是 TUN 连接层特化的，与 `fdconn`（fd 适配器）和 `memconn`（内存实现）语义区分。
 
 **验证**: zigfoundation 272/272 ✅、zigbox 55/55 ✅，zigproxy 不再依赖 zigtun
+
+## fdconn.zig kqueue 兼容修复 (2026-07-21)
+
+**问题**: macOS kqueue 后端 `xev.TCP` 类型中不存在 `ReadError`/`WriteError`/`CloseError` 类型成员。
+编译 `zigbox` 时报错 `S.ReadError` not found。
+
+**根因**: libxev 的 kqueue 后端 TCP watcher 使用模块级错误类型（`xev.ReadError`/`xev.WriteError`/`xev.CloseError`），
+而 epoll/IOCP 后端使用类型特定错误类型（`S.ReadError`/`S.WriteError`/`S.CloseError`）。
+
+**修复**: `fdconn.zig` 中三处回调签名从 `S.ReadError`/`S.WriteError`/`S.CloseError` 改为
+`xev.ReadError`/`xev.WriteError`/`xev.CloseError`。这些是跨平台的模块级类型，所有后端通用。
+
+**验证**: zigfoundation 287 tests ✅、zigbox 全量测试 ✅
+
+## buffer.zig 分级缓冲池 + 空闲收缩 (2026-07-21)
+
+**需求**: zigbox relay 迁移需要三级池（2K UDP 数据报 / 4K 握手 / 16K TCP relay），
+替代 relay struct 中嵌入的栈/堆数组。
+
+**新增**:
+- `pool2K()` / `pool4K()` 工厂函数（已有 `defaultConfig()` 16K）
+- `idle_since_ms` 字段：`acquire` 清除，`release` 时全部空闲则记录时间戳
+- `checkShrink(now_ms, idle_timeout_ms) u32`：外部定时器周期性调用，空闲超时后收缩到初始容量
+
+**验证**: zigfoundation 287 tests ✅（buffer 测试 8→14 项）

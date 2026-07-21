@@ -62,7 +62,7 @@ pub fn FdStream(comptime S: type) type {
                     co: *xev.Completion,
                     s: S,
                     rb: xev.ReadBuffer,
-                    r: S.ReadError!usize,
+                    r: xev.ReadError!usize,
                 ) xev.CallbackAction {
                     _ = s;
                     const n = r catch @as(usize, 0);
@@ -94,7 +94,7 @@ pub fn FdStream(comptime S: type) type {
                     co: *xev.Completion,
                     s: S,
                     wb: xev.WriteBuffer,
-                    r: S.WriteError!usize,
+                    r: xev.WriteError!usize,
                 ) xev.CallbackAction {
                     _ = s;
                     const n = r catch @as(usize, 0);
@@ -123,7 +123,7 @@ pub fn FdStream(comptime S: type) type {
                     l: *xev.Loop,
                     co: *xev.Completion,
                     s: S,
-                    r: S.CloseError!void,
+                    r: xev.CloseError!void,
                 ) xev.CallbackAction {
                     _ = s;
                     _ = r catch {};

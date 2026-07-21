@@ -63,4 +63,11 @@
 - Phase 5: egress (12 tests, total 184)
 - Phase 6: 13 模块集成 + CLI 示例 + iOS/Android 静态库 + 三平台 VM 测试 (13/13)
 
+## 2026-07-21: fdconn kqueue 兼容修复 + buffer 池增强 + tunconn toAsyncStream
+
+- `fdconn.zig`: macOS kqueue 后端兼容 — `S.ReadError`/`S.WriteError`/`S.CloseError` → `xev.ReadError`/`xev.WriteError`/`xev.CloseError`
+- `tunconn.zig`: `TcpConn.toAsyncStream()` 新增 + 2 tests（无 fd → error.NoFd、编译期类型验证）
+- `buffer.zig`: `pool2K()`/`pool4K()` 工厂函数 + `idle_since_ms` + `checkShrink()` + 6 tests
+- `zig build test`: 287/287 ✅（+6 tests，buffer 8→14）
+
 ## 2026-07-17: 项目启动
