@@ -818,6 +818,49 @@ pub fn parseHostPort(host_port: []const u8) !struct { host: []const u8, port: u1
     return .{ .host = host, .port = port };
 }
 
+/// 解析 "host:port" 字符串为 std.Io.net.IpAddress。
+/// 正确区分 IPv4（host:port）、IPv6（[host]:port）和纯 IP（无端口）。
+/// 相比 std.Io.net.IpAddress.parse，此函数先将 host 和 port 分离，
+/// 避免 "10.0.0.1:53" 中的冒号被 std lib 误判为 IPv6 地址。
+pub fn parseHostPortAddr(host_port: []const u8, default_port: u16) !std.Io.net.IpAddress {
+    // 方括号包裹的 IPv6: [ipv6]:port — 用 parseHostPort 拆分
+    if (host_port.len > 2 and host_port[0] == '[') {
+        const parsed = parseHostPort(host_port) catch return error.InvalidHostPort;
+        // parseHostPort 已剥离方括号，直接用 std lib 解析
+        if (std.Io.net.Ip6Address.parse(parsed.host, parsed.port)) |ip6| {
+            return .{ .ip6 = ip6 };
+        } else |_| {}
+        return error.InvalidHostPort;
+    }
+
+    // 冒号计数判断：多个冒号 → IPv6 字面量（如 ::1、fe80::1、2001:db8::1）
+    //                   单个冒号 → host:port 或 IPv4:port
+    const colon_count = std.mem.count(u8, host_port, ":");
+    if (colon_count > 1) {
+        // 纯 IPv6 地址，无显式端口
+        if (std.Io.net.Ip6Address.parse(host_port, default_port)) |ip6| {
+            return .{ .ip6 = ip6 };
+        } else |_| {}
+        return error.InvalidHostPort;
+    }
+
+    // 单个冒号或零冒号：host:port、IPv4:port、或纯 IPv4
+    if (parseHostPort(host_port)) |parsed| {
+        // 尝试 IPv4
+        if (std.Io.net.Ip4Address.parse(parsed.host, parsed.port)) |ip4| {
+            return .{ .ip4 = ip4 };
+        } else |_| {}
+        // 尝试 IPv6（去括号的格式）
+        if (std.Io.net.Ip6Address.parse(parsed.host, parsed.port)) |ip6| {
+            return .{ .ip6 = ip6 };
+        } else |_| {}
+        return error.InvalidHostPort;
+    } else |_| {
+        // 零冒号 — 直接用 default_port 解析为 IP
+        return std.Io.net.IpAddress.parse(host_port, default_port);
+    }
+}
+
 /// 构建 "host:port" 字符串。
 pub fn buildHostPort(host: []const u8, port: u16, buf: *[max_host_port_len]u8) ![]const u8 {
     return std.fmt.bufPrint(buf, "{s}:{d}", .{ host, port });
@@ -1371,4 +1414,50 @@ test "net: isNonPublicV6" {
     try testing.expect(isNonPublicV6(.{ 0xfc, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,1 }));
     try testing.expect(isNonPublicV6(.{ 0xfe, 0x80, 0,0,0,0,0,0,0,0,0,0,0,0,0,1 }));
     try testing.expect(isNonPublicV6(.{0} ** 16));
+}
+
+test "parseHostPortAddr: IPv4 with port" {
+    const addr = try parseHostPortAddr("10.0.0.1:53", 53);
+    try testing.expect(addr == .ip4);
+    try testing.expectEqual(@as(u16, 53), addr.ip4.port);
+    try testing.expectEqualSlices(u8, &[_]u8{ 10, 0, 0, 1 }, &addr.ip4.bytes);
+}
+
+test "parseHostPortAddr: IPv4 without port uses default" {
+    const addr = try parseHostPortAddr("192.168.1.1", 8080);
+    try testing.expect(addr == .ip4);
+    try testing.expectEqual(@as(u16, 8080), addr.ip4.port);
+    try testing.expectEqualSlices(u8, &[_]u8{ 192, 168, 1, 1 }, &addr.ip4.bytes);
+}
+
+test "parseHostPortAddr: bracketed IPv6 with port" {
+    const addr = try parseHostPortAddr("[::1]:53", 0);
+    try testing.expect(addr == .ip6);
+    try testing.expectEqual(@as(u16, 53), addr.ip6.port);
+    try testing.expectEqual(@as(u8, 1), addr.ip6.bytes[15]);
+}
+
+test "parseHostPortAddr: IPv6 without brackets uses default_port" {
+    const addr = try parseHostPortAddr("::1", 5353);
+    try testing.expect(addr == .ip6);
+    try testing.expectEqual(@as(u16, 5353), addr.ip6.port);
+    try testing.expectEqual(@as(u8, 1), addr.ip6.bytes[15]);
+}
+
+test "parseHostPortAddr: domain with port fails" {
+    try testing.expectError(error.InvalidHostPort, parseHostPortAddr("example.com:80", 53));
+}
+
+test "parseHostPortAddr: common IPv4 listen addresses" {
+    const test_cases = [_]struct { input: []const u8, def: u16, ip: Ip4Addr, port: u16 }{
+        .{ .input = "127.0.0.1:53", .def = 53, .ip = .{ 127, 0, 0, 1 }, .port = 53 },
+        .{ .input = "10.0.0.1:1080", .def = 0, .ip = .{ 10, 0, 0, 1 }, .port = 1080 },
+        .{ .input = "0.0.0.0:8080", .def = 80, .ip = .{ 0, 0, 0, 0 }, .port = 8080 },
+    };
+    for (test_cases) |tc| {
+        const addr = try parseHostPortAddr(tc.input, tc.def);
+        try testing.expect(addr == .ip4);
+        try testing.expectEqualSlices(u8, &tc.ip, &addr.ip4.bytes);
+        try testing.expectEqual(tc.port, addr.ip4.port);
+    }
 }
