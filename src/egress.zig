@@ -385,9 +385,9 @@ pub fn getDefaultInterfaceIndex() ?u32 {
 
 /// 将网卡名转换为索引（需要以 null 结尾的缓冲区）
 pub fn ifNameToIndex(name: []const u8) ?u32 {
-    var buf: [16]u8 = [_]u8{0} ** 16;
+    var buf: [17]u8 = [_]u8{0} ** 17;
     @memcpy(buf[0..@min(name.len, 15)], name[0..@min(name.len, 15)]);
-    const idx = std.c.if_nametoindex(buf[0..16 :0].ptr);
+    const idx = std.c.if_nametoindex(@ptrCast(&buf));
     return if (idx > 0) @as(u32, @intCast(idx)) else null;
 }
 
@@ -557,7 +557,7 @@ fn getDefaultInterfaceIndexFallback() ?u32 {
 // ============================================================================
 
 /// getifaddrs 链表节点（跨平台：macOS/Linux）。
-const IfAddrs = extern struct {
+const IfAddrs = if (builtin.os.tag != .windows) extern struct {
     ifa_next: ?*IfAddrs,
     ifa_name: [*:0]u8,
     ifa_flags: c_uint,
@@ -565,15 +565,23 @@ const IfAddrs = extern struct {
     ifa_netmask: ?*std.c.sockaddr,
     ifa_dstaddr: ?*std.c.sockaddr,
     ifa_data: ?*anyopaque,
-};
+} else opaque {};
 
-extern "c" fn getifaddrs(ifap: *?*IfAddrs) c_int;
-extern "c" fn freeifaddrs(ifa: ?*IfAddrs) void;
-extern "c" fn if_indextoname(ifindex: c_uint, ifname: [*]u8) ?[*:0]u8;
+const getifaddrs = if (builtin.os.tag != .windows) struct {
+    extern "c" fn getifaddrs(ifap: *?*IfAddrs) c_int;
+}.getifaddrs else undefined;
+const freeifaddrs = if (builtin.os.tag != .windows) struct {
+    extern "c" fn freeifaddrs(ifa: ?*IfAddrs) void;
+}.freeifaddrs else undefined;
+const if_indextoname_fn = if (builtin.os.tag != .windows) struct {
+    extern "c" fn if_indextoname(ifindex: c_uint, ifname: [*]u8) ?[*:0]u8;
+}.if_indextoname else undefined;
 
 /// 将网卡索引转为名称（跨平台：macOS/Linux）。
+/// Windows 不使用 getifaddrs 路径，此函数不会被调用。
 fn ifIndexToNameBuf(idx: u32, buf: *[16]u8) ?[]const u8 {
-    const ptr = if_indextoname(idx, buf);
+    if (builtin.os.tag == .windows) return null;
+    const ptr = if_indextoname_fn(idx, buf);
     if (ptr == null) return null;
     return std.mem.sliceTo(ptr, 0);
 }
@@ -582,6 +590,8 @@ fn ifIndexToNameBuf(idx: u32, buf: *[16]u8) ?[]const u8 {
 /// 返回写入 buf 的切片，失败返回 null。
 /// 配合 IP_BOUND_IF 使用，bind() 到出口 IP 绕过 TUN 路由循环。
 pub fn getDefaultInterfaceAddr(buf: []u8) ?[]const u8 {
+    // Windows 暂不支持通过 getifaddrs 获取接口地址
+    if (builtin.os.tag == .windows) return null;
     const idx = getDefaultInterfaceIndex() orelse return null;
 
     var name_buf: [16]u8 = [_]u8{0} ** 16;
