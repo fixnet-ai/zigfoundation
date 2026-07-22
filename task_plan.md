@@ -282,3 +282,13 @@
 - `idle_since_ms` 字段 + `checkShrink()` 周期性空闲收缩
 - +6 测试（pool2K/pool4K 配置、checkShrink 收缩/跳过、acquire 清除 idle）
 - 测试总数：287 → 293
+
+### Phase 12: 文档一致性与代码维护 (2026-07-23)
+
+**目标**：同步 CLAUDE.md / README.md / zig-codegen.md / build.zig 与当前代码状态。
+
+- [x] `CLAUDE.md` — 新增 tunconn 模块描述；修正 libxev 计数（6→7）；补充 net 描述
+- [x] `README.md` — 新增 signal 模块；更新 net/egress/platform 描述；新增 test-build
+- [x] `zig-codegen.md` — 修复重复节编号（1.13→1.14→1.15→1.16）
+- [x] `build.zig` — 移除硬编码模块计数
+- **Status:** complete

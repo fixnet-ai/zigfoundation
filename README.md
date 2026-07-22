@@ -11,8 +11,9 @@ fixnet 生态基础库 — 与业务无关的工业级 Zig 基础组件。
 | buffer | 共享缓冲区池（LIFO 复用，按需扩展） |
 | ring | SPSC 无锁环缓冲区 |
 | endian | 大小端读写统一 API |
-| platform | 平台抽象（CPU/内存/DNS/时间） |
-| net | IP 格式化/解析、CIDR、IpPrefix、域名判断 |
+| platform | 平台抽象（CPU/内存/DNS/时间/睡眠） |
+| signal | 跨平台信号处理（Posix/Windows） |
+| net | IP 格式化/解析、CIDR、IpPrefix、PortRange、SocksAddr、host:port 解析、域名判断 |
 | strings | 大小写转换、子串搜索、前后缀匹配 |
 | cli | 命令行框架（zli + 信号处理 + 守护进程化） |
 | log | 跨平台日志（Android logcat / iOS syslog / 桌面 stderr）+ 级别解析 |
@@ -20,7 +21,7 @@ fixnet 生态基础库 — 与业务无关的工业级 Zig 基础组件。
 | store | 持久化 KV 存储（文件系统） |
 | event | 跨平台事件通知（pthread / SRWLOCK） |
 | queue | MPSC 有界队列 |
-| egress | 网络出站路由绑定 + 默认网卡检测 |
+| egress | Socket 创建 + 网络出站路由绑定 + 默认网卡检测 |
 | memconn | 内存网络连接（基于 libxev Completion 模型） |
 | fdconn | fd 流适配器（libxev TCP/File/Stream → 统一 Stream 接口） |
 | tunconn | TUN 连接 vtable 接口（TcpConn/UdpConn/Handler 共享契约） |
@@ -31,6 +32,7 @@ fixnet 生态基础库 — 与业务无关的工业级 Zig 基础组件。
 ```bash
 zig build                    # 构建静态库 libzigfoundation.a
 zig build test               # 运行全部单元测试
+zig build test-build         # 编译测试二进制（交叉编译用）
 ```
 
 ## 平台

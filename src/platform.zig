@@ -12,6 +12,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const c = std.c;
 const native_os = builtin.os.tag;
+const net = @import("net.zig");
 
 // ============================================================
 // 平台检测编译期常量
@@ -209,6 +210,387 @@ fn detectDnsFromResolvConf(allocator: std.mem.Allocator) ?[]const u8 {
         }
     }
     return null;
+}
+
+// ============================================================
+// 系统 DNS 状态管理与替换（TUN auto_route 模式）
+// ============================================================
+
+/// 系统 DNS 状态快照，保存原始 DNS 配置以在退出时恢复。
+pub const SystemDnsState = struct {
+    /// 是否实际修改了系统 DNS
+    changed: bool,
+    /// 分配器（deinit 时用于释放内存）
+    allocator: std.mem.Allocator,
+
+    data: Data,
+
+    const Data = union(enum) {
+        macos: MacOSState,
+        linux: LinuxState,
+        none: void,
+    };
+
+    const MacOSState = struct {
+        /// 修改了 DNS 的网络服务列表
+        services: []MacOSServiceEntry = &.{},
+
+        const MacOSServiceEntry = struct {
+            /// 网络服务名（如 "Wi-Fi"）
+            name: []const u8,
+            /// 原始 DNS 服务器 IP 列表
+            servers: []const []const u8,
+        };
+    };
+
+    const LinuxState = struct {
+        /// /etc/resolv.conf 原始内容
+        original_content: ?[]const u8 = null,
+    };
+
+    /// 创建未修改状态的占位实例。
+    pub fn initUnchanged() SystemDnsState {
+        return .{ .changed = false, .allocator = undefined, .data = .none };
+    }
+
+    /// 释放所有持有的内存。
+    pub fn deinit(self: *SystemDnsState) void {
+        if (!self.changed) {
+            self.* = undefined;
+            return;
+        }
+        switch (self.data) {
+            .macos => |*m| {
+                for (m.services) |*svc| {
+                    self.allocator.free(svc.name);
+                    for (svc.servers) |s| self.allocator.free(s);
+                    self.allocator.free(svc.servers);
+                }
+                self.allocator.free(m.services);
+            },
+            .linux => |*l| {
+                if (l.original_content) |c2| self.allocator.free(c2);
+            },
+            .none => {},
+        }
+        self.* = undefined;
+    }
+};
+
+/// 检测当前系统 DNS 服务器。若为非公网地址（DHCP 网关、私有 IP 等），
+/// 保存原始配置并返回 .changed = true。若已为公网地址则返回 .changed = false。
+///
+/// macOS: 通过 networksetup 检测所有网络服务的 DNS 配置。
+/// Linux: 直接读取 /etc/resolv.conf。
+/// Windows: 返回 initUnchanged()（sing-tun 已在适配器层处理 DNS）。
+pub fn saveSystemDns(allocator: std.mem.Allocator) !SystemDnsState {
+    if (isDarwin) {
+        return saveSystemDnsDarwin(allocator);
+    } else if (isLinux) {
+        return saveSystemDnsLinux(allocator);
+    }
+    return SystemDnsState.initUnchanged();
+}
+
+/// 将系统 DNS 替换为指定地址。仅在 state.changed = true 时有效。
+pub fn setSystemDns(allocator: std.mem.Allocator, state: *const SystemDnsState, dns_ip: []const u8) !void {
+    if (!state.changed) return;
+    if (isDarwin) {
+        try setSystemDnsDarwin(state, dns_ip);
+    } else if (isLinux) {
+        try setSystemDnsLinux(allocator, state, dns_ip);
+    }
+}
+
+/// 恢复原始系统 DNS。仅在 state.changed = true 时执行。
+/// 失败时不返回错误（best-effort 恢复）。
+pub fn restoreSystemDns(state: *SystemDnsState) void {
+    if (!state.changed) return;
+    if (isDarwin) {
+        restoreSystemDnsDarwin(state);
+    } else if (isLinux) {
+        restoreSystemDnsLinux(state);
+    }
+}
+
+// ============================================================
+// macOS DNS 实现（networksetup）
+// ============================================================
+
+/// 在子进程中执行命令，捕获 stdout 输出。返回分配器分配的字符串。
+fn execCaptureOutput(allocator: std.mem.Allocator, cmd: []const u8, args: []const []const u8) ![]const u8 {
+    var pipe_fds: [2]c.fd_t = undefined;
+    if (c.pipe(&pipe_fds) != 0) return error.PipeFailed;
+
+    const pid = c.fork();
+    if (pid < 0) return error.ForkFailed;
+
+    if (pid == 0) {
+        // 子进程：stdout → 管道，关闭 stderr
+        _ = c.close(pipe_fds[0]);
+        _ = c.dup2(pipe_fds[1], c.STDOUT_FILENO);
+        _ = c.close(pipe_fds[1]);
+        _ = c.close(c.STDERR_FILENO);
+
+        // 构建 argv（null 结尾数组，元素为可空指针）
+        const argv_len = args.len + 1; // cmd + args
+        const argv = allocator.allocSentinel(?[*:0]const u8, argv_len, null) catch {
+            c._exit(1);
+        };
+        defer allocator.free(argv);
+        argv[0] = @ptrCast(cmd.ptr);
+        for (args, 0..) |arg, i| {
+            argv[i + 1] = @ptrCast(arg.ptr);
+        }
+        // 最后一个元素已由 allocSentinel 设为 null
+
+        const envp: [1:null]?[*:0]const u8 = .{null};
+        _ = c.execve(@ptrCast(cmd.ptr), argv.ptr, &envp);
+        c._exit(1);
+    }
+
+    _ = c.close(pipe_fds[1]);
+
+    var buf: [4096]u8 = undefined;
+    var total: usize = 0;
+    while (total < buf.len) {
+        const n = c.read(pipe_fds[0], buf[total..].ptr, buf.len - total);
+        if (n <= 0) break;
+        total += @intCast(n);
+    }
+    _ = c.close(pipe_fds[0]);
+    _ = c.waitpid(pid, null, 0);
+
+    const result = try allocator.alloc(u8, total);
+    @memcpy(result, buf[0..total]);
+    return result;
+}
+
+/// 检查 IP 字符串是否是非公网地址（私有、环回、链路本地、组播、未指定）。
+fn isPrivateIpStr(ip_str: []const u8) bool {
+    const ip = net.parseIpv4(ip_str) catch return false;
+    return net.isNonPublicV4(ip);
+}
+
+fn saveSystemDnsDarwin(allocator: std.mem.Allocator) !SystemDnsState {
+    // 1. 列出所有网络服务
+    const services_output = execCaptureOutput(allocator, "/usr/sbin/networksetup", &.{"-listallnetworkservices"}) catch |err| {
+        std.log.warn("[dns] networksetup -listallnetworkservices 失败: {}", .{err});
+        return SystemDnsState.initUnchanged();
+    };
+    defer allocator.free(services_output);
+
+    // 解析服务名（跳过含 * 的标题行和空行）
+    var all_services: std.ArrayList([]const u8) = .empty;
+    defer all_services.deinit(allocator);
+    var lines = std.mem.splitScalar(u8, services_output, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (trimmed.len == 0) continue;
+        if (std.mem.indexOfScalar(u8, trimmed, '*') != null) continue;
+        const name = try allocator.dupe(u8, trimmed);
+        try all_services.append(allocator, name);
+    }
+
+    // 2. 对每个服务获取 DNS 配置，检查是否为非公网地址
+    var changed_services: std.ArrayList(SystemDnsState.MacOSState.MacOSServiceEntry) = .empty;
+    defer changed_services.deinit(allocator);
+
+    for (all_services.items) |svc_name| {
+        const dns_output = execCaptureOutput(allocator, "/usr/sbin/networksetup", &.{ "-getdnsservers", svc_name }) catch |err| {
+            std.log.warn("[dns] networksetup -getdnsservers {s} 失败: {}", .{ svc_name, err });
+            allocator.free(svc_name);
+            continue;
+        };
+        defer allocator.free(dns_output);
+
+        const trimmed_out = std.mem.trim(u8, dns_output, " \t\r\n");
+        // "There aren't any DNS Servers set on ..." → 跳过
+        if (trimmed_out.len == 0 or std.mem.startsWith(u8, trimmed_out, "There aren't any")) {
+            allocator.free(svc_name);
+            continue;
+        }
+
+        // 解析 DNS IP 列表（每行一个 IP）
+        var servers: std.ArrayList([]const u8) = .empty;
+        var has_private = false;
+        var dns_lines = std.mem.splitScalar(u8, trimmed_out, '\n');
+        while (dns_lines.next()) |dns_line| {
+            const ip_str = std.mem.trim(u8, dns_line, " \t\r");
+            if (ip_str.len == 0) continue;
+            // IPv4 → 检查是否为非公网
+            if (net.parseIpv4(ip_str)) |ip| {
+                const s = try allocator.dupe(u8, ip_str);
+                try servers.append(allocator, s);
+                if (net.isNonPublicV4(ip)) {
+                    has_private = true;
+                }
+            } else |_| {
+                // IPv6 或其他格式 → 也保存（可能是公网）
+                const s = try allocator.dupe(u8, ip_str);
+                try servers.append(allocator, s);
+            }
+        }
+
+        if (servers.items.len > 0 and has_private) {
+            try changed_services.append(allocator, .{
+                .name = svc_name,
+                .servers = try servers.toOwnedSlice(allocator),
+            });
+        } else {
+            // 公网 DNS → 不需要修改此服务
+            allocator.free(svc_name);
+            for (servers.items) |s| allocator.free(s);
+            servers.deinit(allocator);
+        }
+    }
+
+    if (changed_services.items.len == 0) {
+        // 所有服务已是公网 DNS
+        return SystemDnsState.initUnchanged();
+    }
+
+    return SystemDnsState{
+        .changed = true,
+        .allocator = allocator,
+        .data = .{ .macos = .{ .services = try changed_services.toOwnedSlice(allocator) } },
+    };
+}
+
+fn setSystemDnsDarwin(state: *const SystemDnsState, dns_ip: []const u8) !void {
+    for (state.data.macos.services) |svc| {
+        _ = execCaptureOutput(state.allocator, "/usr/sbin/networksetup", &.{ "-setdnsservers", svc.name, dns_ip }) catch |err| {
+            std.log.warn("[dns] networksetup -setdnsservers {s} 失败: {}", .{ svc.name, err });
+            return err;
+        };
+    }
+    // 刷新 DNS 缓存
+    _ = execCaptureOutput(state.allocator, "/usr/sbin/dscacheutil", &.{"-flushcache"}) catch {};
+}
+
+fn restoreSystemDnsDarwin(state: *SystemDnsState) void {
+    for (state.data.macos.services) |svc| {
+        if (svc.servers.len == 0) {
+            _ = execCaptureOutput(state.allocator, "/usr/sbin/networksetup", &.{ "-setdnsservers", svc.name, "Empty" }) catch |err| {
+                std.log.warn("[dns] networksetup 恢复 {s} 失败: {}", .{ svc.name, err });
+            };
+        } else {
+            // 构建参数: networksetup -setdnsservers <name> <ip1> <ip2> ...
+            var args: std.ArrayList([]const u8) = .empty;
+            args.append(state.allocator, "-setdnsservers") catch continue;
+            args.append(state.allocator, svc.name) catch continue;
+            for (svc.servers) |s| {
+                args.append(state.allocator, s) catch break;
+            }
+            _ = execCaptureOutput(state.allocator, "/usr/sbin/networksetup", args.items) catch |err| {
+                std.log.warn("[dns] networksetup 恢复 {s} 失败: {}", .{ svc.name, err });
+            };
+        }
+    }
+    // 刷新 DNS 缓存
+    _ = execCaptureOutput(state.allocator, "/usr/sbin/dscacheutil", &.{"-flushcache"}) catch {};
+}
+
+// ============================================================
+// Linux DNS 实现（/etc/resolv.conf）
+// ============================================================
+
+fn isSystemdResolvedStub() bool {
+    // 检查 /etc/resolv.conf 是否指向 systemd-resolved stub
+    var link_buf: [4096]u8 = undefined;
+    const n = c.readlink("/etc/resolv.conf", &link_buf, link_buf.len);
+    if (n < 0) return false; // 不是符号链接
+    const target = link_buf[0..@intCast(n)];
+    return std.mem.indexOf(u8, target, "systemd/resolve") != null;
+}
+
+fn readResolvConf(allocator: std.mem.Allocator) ![]const u8 {
+    const f = c.fopen("/etc/resolv.conf", "r") orelse return error.FileNotFound;
+    defer _ = c.fclose(f);
+
+    var buf: [4096]u8 = undefined;
+    const n = c.fread(&buf, 1, buf.len, f);
+    const content = buf[0..n];
+    return allocator.dupe(u8, content);
+}
+
+fn saveSystemDnsLinux(allocator: std.mem.Allocator) !SystemDnsState {
+    if (isSystemdResolvedStub()) {
+        std.log.debug("[dns] /etc/resolv.conf 由 systemd-resolved 管理，跳过 DNS 替换", .{});
+        return SystemDnsState.initUnchanged();
+    }
+
+    const content = readResolvConf(allocator) catch |err| {
+        std.log.warn("[dns] 无法读取 /etc/resolv.conf: {}", .{err});
+        return SystemDnsState.initUnchanged();
+    };
+
+    // 检查第一个 nameserver 是否为非公网
+    var iter = std.mem.splitScalar(u8, content, '\n');
+    var has_private = false;
+    while (iter.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (std.mem.startsWith(u8, trimmed, "nameserver")) {
+            var parts = std.mem.splitAny(u8, trimmed, " \t");
+            _ = parts.next(); // skip "nameserver"
+            if (parts.next()) |ip_str| {
+                if (isPrivateIpStr(ip_str)) {
+                    has_private = true;
+                    break;
+                }
+            }
+            break; // 只检查第一个 nameserver
+        }
+    }
+
+    if (!has_private) {
+        allocator.free(content);
+        return SystemDnsState.initUnchanged();
+    }
+
+    return SystemDnsState{
+        .changed = true,
+        .allocator = allocator,
+        .data = .{ .linux = .{ .original_content = content } },
+    };
+}
+
+fn setSystemDnsLinux(allocator: std.mem.Allocator, state: *const SystemDnsState, dns_ip: []const u8) !void {
+    const original = state.data.linux.original_content orelse return;
+
+    // 构建新内容：nameserver <dns_ip> + 原有的非 nameserver 行
+    var new_content: std.ArrayList(u8) = .empty;
+    defer new_content.deinit(allocator);
+
+    // 先写入新的 nameserver 行
+    try new_content.appendSlice(allocator, "nameserver ");
+    try new_content.appendSlice(allocator, dns_ip);
+    try new_content.append(allocator, '\n');
+
+    // 保留原有的非 nameserver 行
+    var iter = std.mem.splitScalar(u8, original, '\n');
+    while (iter.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (std.mem.startsWith(u8, trimmed, "nameserver")) continue;
+        try new_content.appendSlice(allocator, line);
+        try new_content.append(allocator, '\n');
+    }
+
+    const content = new_content.items;
+    const f = c.fopen("/etc/resolv.conf", "w") orelse return error.FileNotFound;
+    defer _ = c.fclose(f);
+    _ = c.fwrite(content.ptr, 1, content.len, f);
+}
+
+fn restoreSystemDnsLinux(state: *SystemDnsState) void {
+    const original = state.data.linux.original_content orelse return;
+
+    const f = c.fopen("/etc/resolv.conf", "w") orelse {
+        std.log.warn("[dns] 无法打开 /etc/resolv.conf 进行恢复", .{});
+        return;
+    };
+    defer _ = c.fclose(f);
+    _ = c.fwrite(original.ptr, 1, original.len, f);
 }
 
 // ============================================================

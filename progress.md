@@ -1,5 +1,12 @@
 # Progress Log
 
+## 2026-07-23: 文档统一更新 — CLAUDE.md / README.md / zig-codegen.md / build.zig
+
+- `CLAUDE.md` — 新增 tunconn 模块描述；修正 libxev 模块计数（6→7）；为 tunconn 添加组件标识符；在 net 描述中补充 host:port 解析
+- `README.md` — 模块表新增 signal 模块；更新 net/egress/platform 模块描述；新增 test-build 构建命令
+- `zig-codegen.md` — 修复重复节编号（1.13→1.14→1.15→1.16）
+- `build.zig` — 移除硬编码模块计数
+
 ## 2026-07-21: net.parseHostPortAddr — IPv4/IPv6 host:port 解析
 
 - `net.zig` 新增 `parseHostPortAddr` 函数，正确区分 IPv4/IPv6 的 "host:port" 格式

@@ -95,7 +95,7 @@ pub fn build(b: *std.Build) void {
         .root_module = example_cli_mod,
     });
     const example_cli_install = b.addInstallArtifact(example_cli, .{});
-    const example_cli_step = b.step("example-cli", "构建 CLI 示例程序，集成测试所有 14 模块");
+    const example_cli_step = b.step("example-cli", "构建 CLI 示例程序，集成测试所有模块");
     example_cli_step.dependOn(&example_cli_install.step);
 
     // ---- 示例：iOS 静态库 (aarch64-ios-simulator / x86_64-ios-simulator) ----

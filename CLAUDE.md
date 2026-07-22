@@ -53,7 +53,7 @@ zigfoundation 处于依赖图最底层（仅次于 libxev），提供：
 std only (9):     buffer  ring  endian  platform  net  strings  log  egress  signal
 std + zli (1):    cli
 std + libyaml (1): yaml
-std + libxev (6):  store  event  queue  memconn  fdconn  relay
+std + libxev (7):  store  event  queue  memconn  fdconn  tunconn  relay
 ```
 
 | 模块 | 描述 |
@@ -62,7 +62,7 @@ std + libxev (6):  store  event  queue  memconn  fdconn  relay
 | `ring.zig` | SPSC RingBuf: 跨线程无锁环缓冲区 |
 | `endian.zig` | 大小端读写统一 API |
 | `platform.zig` | 时间获取、平台检测、跨平台睡眠、系统 DNS 探测 |
-| `net.zig` | IP 格式化/解析、CIDR、PortRange、IpAddr、SocksAddr、isNonPublic |
+| `net.zig` | IP 格式化/解析、CIDR、PortRange、IpAddr、SocksAddr、host:port 解析、isNonPublic |
 | `strings.zig` | 大小写转换、子串搜索、前后缀匹配 |
 | `cli.zig` | zli v5.1.2 薄封装 + 跨平台信号处理 + 守护进程化 |
 | `log.zig` | 跨平台日志：Android logcat / Darwin syslog / stderr + ANSI |
@@ -75,6 +75,7 @@ std + libxev (6):  store  event  queue  memconn  fdconn  relay
 | `memconn.zig` | 进程内异步 socket-like 接口 |
 | `fdconn.zig` | fd 流适配器 |
 | `relay.zig` | 通用异步双向数据中继 |
+| `tunconn.zig` | TUN 连接 vtable 接口（TcpConn/UdpConn/Handler 共享契约） |
 
 ## 构建命令
 
@@ -109,7 +110,7 @@ zig build example-android -Dtarget=aarch64-linux-android -Dsysroot="$ANDROID_NDK
 - std only 模块 (9个)：不依赖 libxev 或 zli
 - std + zli (1个)：cli
 - std + libyaml (1个)：yaml
-- std + libxev (6个)：可依赖 std + libxev
+- std + libxev (7个)：可依赖 std + libxev
 - 禁止引入 zio 或任何其他第三方框架（zli 除外）
 
 ## 组件标识
@@ -123,6 +124,7 @@ zig build example-android -Dtarget=aarch64-linux-android -Dsysroot="$ANDROID_NDK
 | `[egress]` | 网络出站 |
 | `[platform]` | 平台抽象 |
 | `[relay]` | 数据中继 |
+| `[tunconn]` | TUN 连接 vtable 接口 |
 
 ## 参考代码
 
