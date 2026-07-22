@@ -1286,6 +1286,89 @@ xcrun simctl spawn booted zig-out/bin/zigfoundation-ios-test
 ```
 
 ---
-*最后更新: 2026-07-19*
+
+## 14. TUN 回包写入（UDP/TCP 包头重写）
+
+TUN 模式下 DNS 劫持等场景需要解析原始 IP 包、修改后写回 TUN。
+以下是三个极易犯错的关键点。
+
+### 14.1 校验和重算三步：清零 → 计算 → 写入
+
+重算 UDP/TCP 校验和时，必须先把校验和字段清零，再用 `rawChecksum()` 计算。
+旧校验和值会污染 one's complement 累加结果。
+
+```zig
+// ❌ 错误: 缓存头中的旧校验和污染 rawChecksum()
+ip_hdr.setTotalLength(total_len);
+udp.setLength(udp_len);
+const ph = pseudoHeaderChecksum(IP_PROTO_UDP, &ip_hdr.src_addr, &ip_hdr.dst_addr, udp_len);
+const csum = internetChecksum(data, rawChecksum(udp_bytes, ph));  // udp_bytes 含旧 csum!
+udp.setChecksum(csum);
+
+// ✅ 正确: 先清零再计算
+udp.setLength(udp_len);
+udp.setChecksum(0);  // ← 必须在 rawChecksum 之前清零
+const ph = pseudoHeaderChecksum(IP_PROTO_UDP, &ip_hdr.src_addr, &ip_hdr.dst_addr, udp_len);
+const csum = internetChecksum(data, rawChecksum(udp_bytes, ph));
+udp.setChecksum(csum);
+```
+
+**同一文件中 TCP 和 UDP 路径必须一致。** TCP 路径正确清零而 UDP 路径未清零，
+这种不一致本身就是代码坏味道。
+
+### 14.2 缓存头回写：所有可变字段必须更新
+
+从入站包缓存的 IP+UDP/TCP 头在写回时，必须更新**全部**可变字段：
+
+| 字段 | 必须更新 | 原因 |
+|------|---------|------|
+| 源/目标 IP | ✅ | NAT 交换 |
+| 源/目标端口 | ✅ | NAT 交换 |
+| IP total_length | ✅ | 响应长度 ≠ 查询长度 |
+| UDP/TCP length | ✅ | 响应长度 ≠ 查询长度 |
+| UDP/TCP checksum | ✅ | 旧值无效 |
+| IP checksum | ✅ | IP 头字段变更后重算 |
+
+```zig
+// ❌ 错误: 漏了 setLength — 查询 42 字节、响应 118 字节，UDP length 仍是 50
+udp.setSrcPort(self.destination.port);
+udp.setDstPort(self.source.port);
+// 缺少 udp.setLength(@intCast(UDP_MIN_SIZE + data.len));
+
+// ✅ 正确: 逐字段更新
+udp.setSrcPort(self.destination.port);
+udp.setDstPort(self.source.port);
+udp.setLength(@intCast(UDP_MIN_SIZE + data.len));  // 响应长度
+```
+
+**检查方法：** 代码审查时，搜索所有缓存包头写回路径，逐一核对上表中的字段是否全部更新。
+`setLength` 方法存在但从未被调用 → 漏掉了。
+
+### 14.3 tcpdump 看到包 ≠ 内核接受包
+
+UDP 校验和错误或长度字段错误时，macOS 内核**静默丢弃**数据包：
+- 无 ICMP 错误回传
+- 无内核日志
+- tcpdump 在 TUN 接口层面仍能看到包（tcpdump 抓在协议栈处理之前）
+
+这意味着 `tcpdump -i utun5` 看到响应包发出但 `dig` 收不到，
+不能排除包头字段错误。排查时必须验证校验和与长度字段。
+
+### 14.4 TUN 写路径禁止 `catch {}` 静默丢错
+
+```zig
+// ❌ 危险: 静默丢弃 TUN 写入错误，出问题时无可调试
+_ = self.tun_device.write(buf) catch {};
+
+// ✅ 正确: 至少 warn 级别日志
+_ = self.tun_device.write(buf) catch |err| {
+    std.log.warn("[stack] tun write failed: {}", .{err});
+};
+```
+
+TUN 写入失败是严重但难以察觉的问题（应用层无反馈），`catch {}` 使排查极其困难。
+
+---
+*最后更新: 2026-07-22*
 *来源: 从 zigtun/zigproxy/zproxy/zigbox 的 zig-codegen.md 提取合并*
-*本次新增: 第 13 章 — 交叉编译 (iOS/Android/Windows)、sysroot、libc 配置、CallingConvention、@alignCast、LazyPath、Windows socket/mutex/I/O 模式*
+*本次新增: 第 14 章 — TUN 回包写入（校验和清零、缓存头字段更新、tcpdump 可见性陷阱、catch {} 禁止）*
