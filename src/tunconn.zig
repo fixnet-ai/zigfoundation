@@ -112,8 +112,11 @@ pub const TcpConn = struct {
         localAddrFn: *const fn (ptr: *anyopaque) SocksAddr,
         remoteAddrFn: *const fn (ptr: *anyopaque) SocksAddr,
         /// 返回底层 fd (System Stack) 或 null (lwIP)。
-        /// 用于 libxev 异步 I/O: 有 fd 可用 xev.TCP.initFd, 无 fd 需 Timer 轮询。
+        /// 用于 libxev 异步 I/O: 有 fd 可用 xev.TCP.initFd, 无 fd 需 async 通知。
         fdFn: ?*const fn (ptr: *anyopaque) ?std.posix.socket_t = null,
+        /// 返回 xev.Async 通知器 (lwIP 数据到达时 notify)，null = 无异步通知。
+        /// lwIP 连接通过此通知器唤醒事件循环，fd 连接通过 kqueue/epoll 驱动。
+        asyncFn: ?*const fn (ptr: *anyopaque) ?*xev.Async = null,
     };
 
     pub fn read(self: TcpConn, buf: []u8) anyerror!usize {
@@ -142,6 +145,12 @@ pub const TcpConn = struct {
         return null;
     }
 
+    /// 返回 xev.Async 通知器 (lwIP 连接) 或 null (fd 连接)。
+    pub fn async(self: TcpConn) ?*xev.Async {
+        if (self.vtable.asyncFn) |f| return f(self.ptr);
+        return null;
+    }
+
     /// 将 TcpConn 转换为 relay 兼容的异步 Stream（通过底层 fd 创建 xev.TCP + FdStream 包装）。
     ///
     /// 前提：连接必须有底层 fd（System Stack 返回有效 fd，lwIP 返回 null）。
@@ -153,6 +162,230 @@ pub const TcpConn = struct {
         const sock_fd = self.fd() orelse return error.NoFd;
         const tcp = xev.TCP.initFd(sock_fd);
         return .{ .inner = tcp };
+    }
+
+    /// 将 TcpConn 转换为 relay 兼容的异步 Stream（支持 fd 和 lwIP 两种后端）。
+    ///
+    /// fd 连接 → FdStream(xev.TCP)；lwIP 连接 → LwipStream。
+    /// 与 toAsyncStream 不同，此方法对 lwIP 连接也有效。
+    ///
+    /// allocator 用于 lwIP 路径中 ReadOp 的堆分配（fd 路径不使用）。
+    ///
+    /// **所有权转移**：调用成功后连接所有权移交给返回的 Stream，
+    /// relay 关闭时自动清理，调用者不可再调用 conn.close()。
+    pub fn toStream(self: TcpConn, allocator: std.mem.Allocator) !TcpStream {
+        if (self.fd()) |sock_fd| {
+            const tcp = xev.TCP.initFd(sock_fd);
+            return .{ .fd = .{ .inner = tcp } };
+        }
+        if (self.async()) |notify| {
+            return .{ .lwip = LwipStream{ .conn = self, .async_notify = notify, .allocator = allocator } };
+        }
+        return error.NoFd;
+    }
+};
+
+// ============================================================================
+// LwipStream — lwIP TCP 连接异步 Stream 适配器
+// ============================================================================
+
+/// 将无 fd 的 TcpConn（lwIP 后端）适配为 relay 兼容的 Stream 接口。
+/// 使用 xev.Async 通知数据到达事件（lwIP recv 回调 → notify → 事件循环唤醒）。
+///
+/// Stream 接口（与 memconn.MemStream / fdconn.FdStream 一致）：
+/// - read(loop, c, buf, Userdata, userdata, cb)
+/// - write(loop, c, buf, Userdata, userdata, cb)
+/// - close(loop, c, Userdata, userdata, cb)
+pub const LwipStream = struct {
+    conn: TcpConn,
+    async_notify: *xev.Async,
+    allocator: std.mem.Allocator,
+
+    /// 异步读 — 等待 lwIP 数据到达后读取。
+    /// 先尝试同步读；若无数据则通过 xev.Async 等待，唤醒后重试。
+    pub fn read(
+        self: *LwipStream,
+        loop: *xev.Loop,
+        c: *xev.Completion,
+        buf: []u8,
+        comptime Userdata: type,
+        userdata: ?*Userdata,
+        comptime cb: *const fn (
+            ud: ?*Userdata,
+            l: *xev.Loop,
+            c_inner: *xev.Completion,
+            b: []u8,
+            r: error{Closed}!usize,
+        ) xev.CallbackAction,
+    ) void {
+        // 先尝试同步读
+        const n = self.conn.read(buf) catch 0;
+        if (n > 0) {
+            std.log.debug("[lwip.stream] read sync ok: n={d}", .{n});
+            _ = cb(userdata, loop, c, buf, n);
+            return;
+        }
+        std.log.debug("[lwip.stream] read async wait: n={d}", .{n});
+        // 无数据 → 分配 ReadOp 等待异步通知
+        const ReadOpT = struct {
+            lwip: *LwipStream,
+            buf: []u8,
+            userdata: ?*Userdata,
+            done_cb: *const fn (
+                ud: ?*Userdata,
+                l: *xev.Loop,
+                c_inner: *xev.Completion,
+                b: []u8,
+                r: error{Closed}!usize,
+            ) xev.CallbackAction,
+            pub fn onWake(
+                ud: ?*@This(),
+                l: *xev.Loop,
+                co: *xev.Completion,
+                r2: xev.Async.WaitError!void,
+            ) xev.CallbackAction {
+                _ = r2 catch {};
+                const op = ud.?;
+                const n2 = op.lwip.conn.read(op.buf) catch |err| {
+                    if (err == error.WouldBlock) {
+                        // 虚假唤醒：无数据，重新等待
+                        std.log.debug("[lwip.stream] onWake: WouldBlock, re-wait", .{});
+                        op.lwip.async_notify.wait(l, co, @This(), op, onWake);
+                        return .disarm;
+                    }
+                    // 其他错误：关闭
+                    std.log.debug("[lwip.stream] onWake: read err={any}", .{err});
+                    _ = op.done_cb(op.userdata, l, co, op.buf, 0);
+                    op.lwip.allocator.destroy(op);
+                    return .disarm;
+                };
+                const ret = op.done_cb(op.userdata, l, co, op.buf, n2);
+                op.lwip.allocator.destroy(op);
+                return ret;
+            }
+        };
+        const op = self.allocator.create(ReadOpT) catch {
+            _ = cb(userdata, loop, c, buf, 0);
+            return;
+        };
+        op.* = .{ .lwip = self, .buf = buf, .userdata = userdata, .done_cb = cb };
+        self.async_notify.wait(loop, c, ReadOpT, op, ReadOpT.onWake);
+    }
+
+    /// 异步写 — 通过 lwIP tcp_write 同步完成，直接回调。
+    pub fn write(
+        self: *LwipStream,
+        loop: *xev.Loop,
+        c: *xev.Completion,
+        buf: []const u8,
+        comptime Userdata: type,
+        userdata: ?*Userdata,
+        comptime cb: *const fn (
+            ud: ?*Userdata,
+            l: *xev.Loop,
+            c_inner: *xev.Completion,
+            b: []const u8,
+            r: error{Closed}!usize,
+        ) xev.CallbackAction,
+    ) void {
+        const n = self.conn.write(buf) catch |err| {
+            std.log.debug("[lwip.stream] write err: {any}", .{err});
+            _ = cb(userdata, loop, c, buf, 0);
+            return;
+        };
+        _ = cb(userdata, loop, c, buf, n);
+    }
+
+    /// 异步关闭 — 关闭 lwIP 连接，通知等待中的 read。
+    pub fn close(
+        self: *LwipStream,
+        loop: *xev.Loop,
+        c: *xev.Completion,
+        comptime Userdata: type,
+        userdata: ?*Userdata,
+        comptime cb: *const fn (
+            ud: ?*Userdata,
+            l: *xev.Loop,
+            c_inner: *xev.Completion,
+            r: void,
+        ) xev.CallbackAction,
+    ) void {
+        std.log.debug("[lwip.stream] close", .{});
+        self.conn.close();
+        self.async_notify.notify() catch {};
+        _ = cb(userdata, loop, c, {});
+    }
+};
+
+// ============================================================================
+// TcpStream — TcpConn Stream 适配器（fd + lwIP 后端统一封装）
+// ============================================================================
+
+/// 将 TcpConn 转换为 relay 兼容的异步 Stream。
+/// 内部自动选择 fd 路径 (FdStream) 或 lwIP 路径 (LwipStream)。
+pub const TcpStream = union(enum) {
+    fd: fdconn.FdStream(xev.TCP),
+    lwip: LwipStream,
+
+    pub fn read(
+        self: *TcpStream,
+        loop: *xev.Loop,
+        c: *xev.Completion,
+        buf: []u8,
+        comptime Userdata: type,
+        userdata: ?*Userdata,
+        comptime cb: *const fn (
+            ud: ?*Userdata,
+            l: *xev.Loop,
+            c_inner: *xev.Completion,
+            b: []u8,
+            r: error{Closed}!usize,
+        ) xev.CallbackAction,
+    ) void {
+        switch (self.*) {
+            .fd => |*s| s.read(loop, c, buf, Userdata, userdata, cb),
+            .lwip => |*s| s.read(loop, c, buf, Userdata, userdata, cb),
+        }
+    }
+
+    pub fn write(
+        self: *TcpStream,
+        loop: *xev.Loop,
+        c: *xev.Completion,
+        buf: []const u8,
+        comptime Userdata: type,
+        userdata: ?*Userdata,
+        comptime cb: *const fn (
+            ud: ?*Userdata,
+            l: *xev.Loop,
+            c_inner: *xev.Completion,
+            b: []const u8,
+            r: error{Closed}!usize,
+        ) xev.CallbackAction,
+    ) void {
+        switch (self.*) {
+            .fd => |*s| s.write(loop, c, buf, Userdata, userdata, cb),
+            .lwip => |*s| s.write(loop, c, buf, Userdata, userdata, cb),
+        }
+    }
+
+    pub fn close(
+        self: *TcpStream,
+        loop: *xev.Loop,
+        c: *xev.Completion,
+        comptime Userdata: type,
+        userdata: ?*Userdata,
+        comptime cb: *const fn (
+            ud: ?*Userdata,
+            l: *xev.Loop,
+            c_inner: *xev.Completion,
+            r: void,
+        ) xev.CallbackAction,
+    ) void {
+        switch (self.*) {
+            .fd => |*s| s.close(loop, c, Userdata, userdata, cb),
+            .lwip => |*s| s.close(loop, c, Userdata, userdata, cb),
+        }
     }
 };
 
