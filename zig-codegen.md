@@ -1437,7 +1437,158 @@ const csum = checksum.transportChecksumV4(protocol, src, dst, full_transport_seg
 ```
 
 ---
+
+## 16. `catch` 语法完整手册（Zig 0.16.0）
+
+`catch` 是 Zig 错误处理核心机制，容易在琐碎细节上写错。本章覆盖全部形态和经典陷阱。
+
+### 16.1 基本形态
+
+| 形态 | 语法 | 用途 |
+|------|------|------|
+| 默认值 | `expr catch default` | 错误时返回备选值 |
+| 捕获 + 默认值 | `expr catch \|e\| default` | 捕获错误值并返回备选值 |
+| 匿名块 | `expr catch { ... }` | 错误时执行块（不捕获错误） |
+| 捕获 + 块 | `expr catch \|e\| { ... }` | 捕获错误值并执行块 |
+
+### 16.2 类型匹配规则（核心）
+
+`expr: E!T` 与 catch 处理器的类型关系：
+
+```
+expr catch default        → default 必须是 T
+expr catch |e| default    → default 必须是 T
+expr catch { block }      → block 必须返回 T 或 noreturn
+expr catch |e| { block }  → block 必须返回 T 或 noreturn
+```
+
+**关键例外**：`_ =` 放宽类型匹配。`_ = expr catch |e| { void_block }` 允许块返回 void。
+
+```zig
+fn foo() !usize { return error.Oops; }
+
+// ❌ 编译错误: incompatible types: 'usize' and 'void'
+foo() catch |e| { std.log.warn("{any}", .{e}); };
+
+// ✅ 加 _ = 后编译通过 — 类型检查放宽
+_ = foo() catch |e| { std.log.warn("{any}", .{e}); };
+
+// ❌ 编译错误: incompatible types: 'usize' and 'void'
+const x = foo() catch |e| { std.log.warn("{any}", .{e}); };
+
+// ✅ const 赋值需要块返回值匹配 T
+const x = foo() catch |e| blk: {
+    std.log.warn("{any}", .{e});
+    break :blk 0;  // 返回值匹配 usize
+};
+```
+
+**规则记忆**：不需要结果时加 `_ =`；需要结果时 catch 块必须显式返回匹配值。
+
+### 16.3 错误值不可丢弃（0.16.0 新增严格检查）
+
+`catch |e|` 捕获的错误值必须被使用，不可 `_ = e` 丢弃。
+
+```zig
+// ❌ 编译错误: "error set is discarded"
+_ = foo() catch |e| {
+    _ = e;
+};
+
+// ✅ 正确: 使用错误值（传给函数、比较等）
+_ = foo() catch |e| {
+    std.log.warn("failed: {any}", .{e});       // 传入格式化
+};
+
+_ = foo() catch |e| {
+    if (e == error.WouldBlock) return;          // 条件判断
+    std.log.err("unexpected: {any}", .{e});
+};
+
+// ✅ 如果不需要错误值，用 catch {} 不捕获
+_ = foo() catch {};
+```
+
+### 16.4 noreturn 模式（无类型限制）
+
+catch 块内使用 `return`、`continue`、`break`、`unreachable` 时，块为 noreturn，无类型匹配约束。
+
+```zig
+// ✅ 错误传播（等同于 try）
+const x = foo() catch |e| return e;
+
+// ✅ 记录后传播
+const x = foo() catch |e| {
+    std.log.err("fail: {any}", .{e});
+    return e;
+};
+
+// ✅ 循环内跳过
+for (items) |item| {
+    const x = process(item) catch |e| {
+        std.log.warn("skip: {any}", .{e});
+        continue;
+    };
+    _ = x;
+}
+
+// ✅ 断言无错误
+const x = foo() catch unreachable;
+```
+
+### 16.5 `catch` vs `try` vs `if`
+
+| 用法 | 等价 | 何时用 |
+|------|------|--------|
+| `try expr` | `expr catch \|e\| return e` | 只做错误传播 |
+| `expr catch \|e\| { log; return e; }` | — | 传播前记录 |
+| `expr catch default` | — | 提供备选值 |
+| `_ = expr catch \|e\| { log; }` | — | 忽略结果，仅记录 |
+| `if (expr) \|v\| { ... } else \|e\| { ... }` | — | 分支处理成功/失败 |
+
+```zig
+// 简单传播: try
+const result = try maybeFail();
+
+// 记录后传播: catch |e| return e（不能用 try）
+const result = maybeFail() catch |e| {
+    std.log.err("failed at step 3: {any}", .{e});
+    return e;
+};
+
+// 备选值
+const port = parsePort(s) catch 8080;
+
+// 忽略结果不关心
+_ = conn.write(data) catch |e| {
+    std.log.warn("write lost: {any}", .{e});
+};
+```
+
+### 16.6 经典错误速查
+
+| 代码 | 错误信息 | 正确写法 |
+|------|---------|---------|
+| `err() catch \|e\| { log; }` | `incompatible types: 'usize' and 'void'` | `_ = err() catch \|e\| { log; };` |
+| `err() catch \|e\| { _ = e; }` | `error set is discarded` | `err() catch \|e\| { log("{any}", .{e}); }` 或 `err() catch {}` |
+| `error.Foo catch ...` | `expected error union type` | 纯错误类型无 catch，只有 `!T` 错误联合才有 |
+| `x catch \|e\| return` | `expected expression` | `x catch \|e\| return e` — 必须返回具体错误值 |
+| `try x catch ...` | 语法错误 | `try` 和 `catch` 二选一，不可叠加 |
+| `catch \|e\| { return; }` 在非 void 函数 | `incompatible types` | 用 `return e;` 或 `return error.Foo;` |
+
+### 16.7 字符串字面量中的 `{}` 转义
+
+catch 块中 `std.log.warn("msg {}", .{arg})` 的 `{}` 与 catch 块的 `{...}` 是不同的解析上下文，不存在歧义。`{{` 和 `}}` 用于格式化字面量中的花括号。
+
+```zig
+// ✅ 无歧义 — 日志 {} 在字符串内，与 catch { 不冲突
+_ = foo() catch |e| {
+    std.log.warn("error: {any}", .{e});
+};
+```
+
+---
 *最后更新: 2026-07-22*
 *来源: 从 zigtun/zigproxy/zproxy/zigbox 的 zig-codegen.md 提取合并*
-*本次新增: 第 15 章 — 校验和 API 语义（internetChecksum vs rawChecksum、双重取反陷阱、lwip 本地差异、嵌套校验和）*
-*上一次: 第 14 章 — TUN 回包写入（校验和清零、缓存头字段更新、tcpdump 可见性陷阱、catch {} 禁止）*
+*本次新增: 第 16 章 — catch 语法完整手册（类型匹配规则、错误值不可丢弃、noreturn 模式、经典错误速查）*
+*上一次: 第 15 章 — 校验和 API 语义（internetChecksum vs rawChecksum、双重取反陷阱、lwip 本地差异、嵌套校验和）*
