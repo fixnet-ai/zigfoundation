@@ -1588,7 +1588,74 @@ _ = foo() catch |e| {
 ```
 
 ---
+---
+
+## 17. `catch 0` vs `catch |err|` — 异步回调中的错误语义
+
+### 17.1 核心教训
+
+`catch 0` 将**所有**错误映射为 `0`，丢失错误语义。在 relay/桥接模式的异步回调中，这会导致将 `WouldBlock`（无数据但连接正常）误判为 EOF（连接关闭），引发虚假关闭。
+
+```zig
+// ❌ 危险：WouldBlock 和 Closed 都返回 0，relay 无法区分
+const n = conn.read(buf) catch 0;
+
+// ✅ 正确：显式处理 WouldBlock，重新等待而非报告 EOF
+const n = conn.read(buf) catch |err| {
+    if (err == error.WouldBlock) {
+        async.wait(l, co, self, op, onWake);  // 重新等待
+        return .disarm;
+    }
+    // 其他错误 → 真正关闭
+    _ = done_cb(userdata, l, co, buf, 0);
+    return .disarm;
+};
+```
+
+### 17.2 适用场景：有虚假唤醒的异步等待
+
+带 `xev.Async` 等待的 relay 模式，如果以下条件同时满足，`catch 0` **必定产生 bug**：
+
+1. 异步通知源可能**虚假唤醒**（如共享的 `xev.Async`）
+2. `read()` 在无数据时返回 `WouldBlock`（而非 `0`）
+3. `n=0` 被 relay 层解释为 EOF → 关闭连接
+
+**虚假唤醒的典型来源**：共享 `xev.Async` + 定时器对所有连接调 `notify()`。
+
+### 17.3 例外：同步轮询路径
+
+同步 relay `readFn` 中 `catch 0` 是**安全**的，因为 relay 主循环会自然重试 WouldBlock：
+
+```zig
+// ✅ 同步 readFn 安全：WouldBlock 时 relay 会再次调用
+fn readFn(self: *Self, buf: []u8) !usize {
+    return self.conn.read(buf) catch 0;
+}
+```
+
+### 17.4 何时需要 |err| 显式处理
+
+| 场景 | 推荐 | 原因 |
+|------|------|------|
+| 同步 relay readFn | `catch 0` | relay 主循环自然重试 |
+| 异步 onWake（无虚假唤醒风险） | `catch 0` | 每次 notify 对应确切的数据到达 |
+| 异步 onWake（有虚假唤醒风险） | `catch \|err\|` + WouldBlock 重等 | WouldBlock ≠ EOF |
+| relay onEof 回调 | 不适用 | relay 框架已有 close 逻辑 |
+
+### 17.5 调试经验
+
+**症状**：TUN 透明代理下所有 TCP 连接返回"Empty reply from server"。
+**定位**：日志显示 `recv_buf` 有数据（76 字节），`read()` 第一次成功，第二次 `WouldBlock` → `catch 0` → relay sees EOF → close。
+**确认**：定时器 250ms 周期性触发 `notify()`，验证虚假唤醒假说。
+
+```
+数据流正常:  [数据到达] → recv_buf ← [read 76] ✅
+                ↓
+虚假唤醒:    [timer notify] → read → WouldBlock → catch 0 → EOF → close ❌
+```
+
+---
 *最后更新: 2026-07-22*
 *来源: 从 zigtun/zigproxy/zproxy/zigbox 的 zig-codegen.md 提取合并*
-*本次新增: 第 16 章 — catch 语法完整手册（类型匹配规则、错误值不可丢弃、noreturn 模式、经典错误速查）*
-*上一次: 第 15 章 — 校验和 API 语义（internetChecksum vs rawChecksum、双重取反陷阱、lwip 本地差异、嵌套校验和）*
+*本次新增: 第 17 章 — catch 0 vs catch |err| 在异步回调中的错误语义（虚假唤醒、WouldBlock vs EOF、适用场景速查）*
+*上一次: 第 16 章 — catch 语法完整手册（类型匹配规则、错误值不可丢弃、noreturn 模式、经典错误速查）*
