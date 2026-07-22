@@ -1369,6 +1369,75 @@ _ = self.tun_device.write(buf) catch |err| {
 TUN 写入失败是严重但难以察觉的问题（应用层无反馈），`catch {}` 使排查极其困难。
 
 ---
+
+## 15. 校验和 API 语义与常见陷阱
+
+### 15.1 zigtun checksum.zig 核心 API
+
+| 函数 | 返回值 | 直接写入头？ |
+|------|--------|------------|
+| `internetChecksum(data, initial)` | **取反和**（~raw_sum） | ✅ 直接 `setChecksum(internetChecksum(...))` |
+| `rawChecksum(data, initial)` | **原始和**（raw_sum） | ❌ 需 `setChecksum(~rawChecksum(...))` 或 `setChecksum(internetChecksum(...))` |
+| `pseudoHeaderChecksum(...)` | **非折叠 u32** 原始和 | ❌ 仅作为 initial 参数传入 |
+| `transportChecksumV4(...)` | **取反和** | ✅ 直接使用 |
+
+### 15.2 双重取反陷阱
+
+`internetChecksum()` 已经返回取反值（~raw_sum），再加 `~` 得到原始和，存储后校验和错误：
+
+```zig
+// ❌ Bug: ~internetChecksum = ~~raw = raw_sum（原始和，非取反值）
+const csum = ~checksum.internetChecksum(data, 0);
+hdr.setChecksum(csum);
+
+// ✅ 正确: internetChecksum 直接可写入校验和字段
+const csum = checksum.internetChecksum(data, 0);
+hdr.setChecksum(csum);
+```
+
+**原理**：IPv4 校验和验证 `internetChecksum(full_header) == 0`。
+`internetChecksum(zeroed_header) = ~raw_sum`（取反），
+`~internetChecksum(zeroed_header) = raw_sum`（原始），
+只有取反值能通过验证（`~raw_sum + raw_sum = 0xFFFF, ~0xFFFF = 0`）。
+
+### 15.3 lwip_stack.zig 本地 API 差异
+
+`lwip_stack.zig` 有自己独立的 `internetChecksum([]const u16)` 返回**原始和**（NOT 取反）。
+因此调用的语义不同：
+
+| 位置 | 本地函数 | 返回值 | 存储模式 |
+|------|---------|--------|---------|
+| `calculateChecksum()` | `internetChecksum(asU16())` | 原始和 | `setChecksum(~calculateChecksum())` |
+| `icmpv4Checksum()` | `~internetChecksum()` | 取反和 | `setChecksum(icmpv4Checksum())` |
+| `icmpv6Checksum()` | `~internetChecksum()` | 取反和 | `setChecksum(icmpv6Checksum())` |
+
+**两条检查清单**：
+1. 确认调用的是哪个 `internetChecksum`（checksum.zig 还是 lwip_stack 本地）
+2. 校验和计算前必须 `setChecksum(0)` 清零字段
+
+### 15.4 嵌套校验和
+
+多段校验和不能嵌套 `internetChecksum()` 调用（取反值无法穿越 1's complement 加法）：
+
+```zig
+// ❌ Bug: 嵌套 internetChecksum，取反值+取反值 ≠ 正确组合
+const inner = checksum.internetChecksum(payload, pseudo);
+const outer = ~checksum.internetChecksum(header, inner);
+
+// ✅ 正确: 内层用 rawChecksum，外框用 internetChecksum
+const outer = checksum.internetChecksum(header, checksum.rawChecksum(payload, pseudo));
+
+// ✅ 最佳: 单次调用覆盖整段数据
+const outer = checksum.internetChecksum(full_data, pseudo);
+```
+
+或直接使用高层 helper：
+```zig
+const csum = checksum.transportChecksumV4(protocol, src, dst, full_transport_segment);
+```
+
+---
 *最后更新: 2026-07-22*
 *来源: 从 zigtun/zigproxy/zproxy/zigbox 的 zig-codegen.md 提取合并*
-*本次新增: 第 14 章 — TUN 回包写入（校验和清零、缓存头字段更新、tcpdump 可见性陷阱、catch {} 禁止）*
+*本次新增: 第 15 章 — 校验和 API 语义（internetChecksum vs rawChecksum、双重取反陷阱、lwip 本地差异、嵌套校验和）*
+*上一次: 第 14 章 — TUN 回包写入（校验和清零、缓存头字段更新、tcpdump 可见性陷阱、catch {} 禁止）*
