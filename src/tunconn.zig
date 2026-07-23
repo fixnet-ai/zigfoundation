@@ -406,6 +406,8 @@ pub const UdpConn = struct {
         localAddrFn: *const fn (ptr: *anyopaque) SocksAddr,
         /// 返回底层 fd (System Stack) 或 null (lwIP)。
         fdFn: ?*const fn (ptr: *anyopaque) ?std.posix.socket_t = null,
+        /// 返回 xev.Async 通知器 (数据到达时 notify)，null = 无异步通知。
+        asyncFn: ?*const fn (ptr: *anyopaque) ?*xev.Async = null,
     };
 
     pub const ReadFromResult = struct {
@@ -432,6 +434,12 @@ pub const UdpConn = struct {
     /// 返回底层 fd，若无则返回 null。
     pub fn fd(self: UdpConn) ?std.posix.socket_t {
         if (self.vtable.fdFn) |f| return f(self.ptr);
+        return null;
+    }
+
+    /// 返回 xev.Async 通知器，若无则返回 null。
+    pub fn async(self: UdpConn) ?*xev.Async {
+        if (self.vtable.asyncFn) |f| return f(self.ptr);
         return null;
     }
 };
