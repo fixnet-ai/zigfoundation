@@ -346,20 +346,20 @@ fn execCaptureOutput(allocator: std.mem.Allocator, cmd: []const u8, args: []cons
         _ = c.close(pipe_fds[1]);
         _ = c.close(c.STDERR_FILENO);
 
-        // 构建 argv（null 结尾数组，元素为可空指针）
-        const argv_len = args.len + 1; // cmd + args
-        const argv = allocator.allocSentinel(?[*:0]const u8, argv_len, null) catch {
+        // 为每个参数分配 null-terminated 副本（execve 需要 [*:0]const u8）
+        const argv = allocator.allocSentinel(?[*:0]const u8, args.len + 1, null) catch {
             c._exit(1);
         };
-        defer allocator.free(argv);
-        argv[0] = @ptrCast(cmd.ptr);
+        errdefer allocator.free(argv);
+        const cmd_z = allocator.dupeZ(u8, cmd) catch c._exit(1);
+        argv[0] = cmd_z.ptr;
         for (args, 0..) |arg, i| {
-            argv[i + 1] = @ptrCast(arg.ptr);
+            const arg_z = allocator.dupeZ(u8, arg) catch c._exit(1);
+            argv[i + 1] = arg_z.ptr;
         }
         // 最后一个元素已由 allocSentinel 设为 null
 
-        const envp: [1:null]?[*:0]const u8 = .{null};
-        _ = c.execve(@ptrCast(cmd.ptr), argv.ptr, &envp);
+        _ = c.execve(cmd_z.ptr, argv.ptr, c.environ);
         c._exit(1);
     }
 
