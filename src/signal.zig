@@ -52,6 +52,10 @@ var signal_received: std.atomic.Value(bool) = std.atomic.Value(bool).init(false)
 /// 最近一次收到的信号（0 = 无；1/2/3 = interrupt/terminate/hangup）。
 var last_signal: std.atomic.Value(u8) = std.atomic.Value(u8).init(0);
 
+/// Self-pipe 写端 fd — 信号处理器写 1 字节到此 pipe，事件循环读到后立即 stop()。
+/// -1 表示 self-pipe 未启用。用 i32 而非 std.posix.fd_t（Windows 上后者是 void）。
+var signal_pipe_write_fd: i32 = -1;
+
 // ============================================================
 // 公共 API — 回调式（cli.zig 兼容）
 // ============================================================
@@ -100,6 +104,45 @@ pub fn exitRequested() bool {
 /// isShuttingDown 别名（兼容 zigtun legacy API）。
 pub fn isShuttingDown() bool {
     return exitRequested();
+}
+
+// ============================================================
+// Self-pipe 信号通知机制
+// ============================================================
+
+/// 创建 self-pipe 并返回读端 fd（仅 macOS/Linux）。
+/// 调用者应将读端 fd 注册到事件循环，收到可读事件时调用 loop.stop()。
+/// 信号处理器在收到 SIGINT/SIGTERM 时会向 pipe 写 1 字节。
+/// Windows 不支持 — 调用者需用 timer 轮询 isShuttingDown() 作为降级方案。
+pub fn setupSignalPipe() !i32 {
+    if (builtin.os.tag == .windows) {
+        @compileError("self-pipe 不支持 Windows，用 timer 轮询 isShuttingDown() 替代");
+    }
+    var pipe_fds: [2]std.c.fd_t = undefined;
+    if (std.c.pipe(&pipe_fds) != 0) {
+        return error.PipeFailed;
+    }
+    errdefer {
+        _ = std.c.close(pipe_fds[1]);
+        _ = std.c.close(pipe_fds[0]);
+    }
+
+    // 注意：不设 O_NONBLOCK。
+    // 读端由 kqueue/epoll 驱动 read()，可读时数据立即可得，不会阻塞。
+    // 写端由信号处理器调用，write() 写 1 字节到 pipe buffer（≥4KB），
+    // 单字节写入永不阻塞。
+
+    signal_pipe_write_fd = pipe_fds[1];
+    return pipe_fds[0];
+}
+
+/// 关闭 self-pipe 写端。应在 signal handler 卸载后调用。
+pub fn deinitSignalPipe() void {
+    if (builtin.os.tag == .windows) return;
+    if (signal_pipe_write_fd >= 0) {
+        _ = std.c.close(signal_pipe_write_fd);
+        signal_pipe_write_fd = -1;
+    }
 }
 
 // ============================================================
@@ -217,10 +260,15 @@ fn installPosixHandlers(signals: []const Signal) !void {
     }
 }
 
-/// POSIX 标志处理器（供 SignalContext 使用 — 只设标志，不触发回调）。
+/// POSIX 标志处理器（供 SignalContext 使用 — 设置原子标志 + 写入 self-pipe）。
 fn signalFlagHandler(sig: std.c.SIG) callconv(.c) void {
     _ = sig;
     signal_received.store(true, .release);
+    // write() 是 async-signal-safe，不分配内存、不加锁
+    if (signal_pipe_write_fd >= 0) {
+        const data = [_]u8{1};
+        _ = std.c.write(signal_pipe_write_fd, &data, 1);
+    }
 }
 
 // ---- Windows 实现 ----

@@ -405,3 +405,32 @@ zigbox (编排层，连接两者)
 2. 未 null-terminated 的 args → 改为 `dupeZ` 分配
 
 **验证**：`networksetup -getdnsservers Wi-Fi` 确认 223.5.5.5 → 198.18.0.2，--full-proxy TUN 模式正常上网。
+
+## Self-pipe 信号通知机制 (2026-07-24)
+
+### 背景
+
+zigbox Ctrl+C 优雅退出需要即时感知 SIGINT/SIGTERM。旧方案用 500ms 定时器轮询 `isShuttingDown()`，timer 错误时永久 disarm。
+
+### 设计
+
+**self-pipe trick**：信号处理器（async-signal-safe）写 1 字节到 pipe，事件循环通过 kqueue/epoll 读端可读即时感知信号。
+
+### 实现
+
+| 函数 | 功能 |
+|------|------|
+| `setupSignalPipe()` | `std.c.pipe()` 创建 pipe，返回读端 fd（仅 POSIX，Windows `@compileError`） |
+| `deinitSignalPipe()` | 关闭写端 |
+| `signalFlagHandler()` 修改 | 设原子标志后 `std.c.write(pipe_fd, &data, 1)` |
+
+**跨平台**：
+- macOS/Linux：self-pipe 零延迟
+- Windows：`@compileError` 阻止调用，调用者用 timer 轮询 `isShuttingDown()` 降级
+
+### Zig 0.16.0 教训
+
+- `std.posix.pipe()`/`write()`/`close()`/`fcntl()` 全部移除 → 用 `std.c.pipe/write/close`
+- `std.c.close` 在 macOS 映射到 `darwin.@"close$NOCANCEL"`
+- `fcntl` 无替代，O_NONBLOCK 对 self-pipe 非必需（kqueue 驱动 read，数据立即可得）
+- `std.posix.fd_t` 在 Windows 是 `void` → 跨平台代码用 `i32` 存 fd

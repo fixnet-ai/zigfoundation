@@ -93,4 +93,12 @@
 - 保存所有有 DNS 配置的网络服务（不限公/私有）
 - zigbox --full-proxy 使用：强制系统 DNS → TUN 劫持地址，确保域名经 FakeIP 恢复
 
+## 2026-07-24: Self-pipe 信号通知机制
+
+- `signal.zig`：新增 `setupSignalPipe()`/`deinitSignalPipe()`，`signalFlagHandler` 写 pipe
+- Self-pipe trick：信号处理器写 1 字节 → 事件循环即时感知 → 零延迟
+- 跨平台：POSIX self-pipe；Windows `@compileError`（timer 轮询降级）
+- 适配 Zig 0.16.0：`std.c.pipe/write/close` 替代已移除的 `std.posix.*`
+- `signal_pipe_write_fd` 类型从 `std.posix.fd_t` 改为 `i32`（Windows 兼容）
+
 ## 2026-07-17: 项目启动
