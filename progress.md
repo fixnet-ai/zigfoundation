@@ -86,4 +86,11 @@
 - `buffer.zig`: `pool2K()`/`pool4K()` 工厂函数 + `idle_since_ms` + `checkShrink()` + 6 tests
 - `zig build test`: 287/287 ✅（+6 tests，buffer 8→14）
 
+## 2026-07-23: saveAllSystemDns — 全部服务 DNS 保存
+
+- 新增 `saveAllSystemDns` + `saveAllSystemDnsDarwin`（+83 行）
+- 与 `saveSystemDnsDarwin` 结构相同，移除 `isNonPublicV4` 检查
+- 保存所有有 DNS 配置的网络服务（不限公/私有）
+- zigbox --full-proxy 使用：强制系统 DNS → TUN 劫持地址，确保域名经 FakeIP 恢复
+
 ## 2026-07-17: 项目启动

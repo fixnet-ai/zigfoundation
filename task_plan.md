@@ -292,3 +292,22 @@
 - [x] `zig-codegen.md` — 修复重复节编号（1.13→1.14→1.15→1.16）
 - [x] `build.zig` — 移除硬编码模块计数
 - **Status:** complete
+
+---
+
+### Phase 13: saveAllSystemDns — 全部服务 DNS 保存 (2026-07-23) ✅
+
+**目标**：zigbox --full-proxy 强制所有网络服务 DNS 指向 TUN 劫持地址。现有 `saveSystemDns` 仅保存非公网 DNS 的服务（`isNonPublicV4` 检查），公网 DNS 服务被跳过。`saveAllSystemDns` 保存所有有 DNS 配置的服务。
+
+**文件变更**：
+
+| 操作 | 文件 | 说明 |
+|------|------|------|
+| 新增 | `src/platform.zig:474-540` | `saveAllSystemDns` + `saveAllSystemDnsDarwin` (+83 行) |
+
+**设计决策**：
+- 与 `saveSystemDnsDarwin` 结构相同，仅移除 `isNonPublicV4` 检查
+- 始终返回 `changed = true`
+- macOS 专用实现；Linux `saveSystemDnsLinux` 不区分公/私有，共用即可
+
+- **Status:** complete

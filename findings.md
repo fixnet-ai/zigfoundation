@@ -387,3 +387,13 @@ zigbox (编排层，连接两者)
 任何调用 `std.Io.net.IpAddress.parse(host_port_str, default_port)` 的地方都可能受影响。
 
 **验证**: zigfoundation 293 tests ✅
+
+## saveAllSystemDns 与 execCaptureOutput 空 envp (2026-07-23)
+
+### saveAllSystemDns 设计
+
+`saveSystemDnsDarwin` 通过 `isNonPublicV4` 跳过公网 DNS 服务 — zigbox 正常模式下这是期望行为（只替换内网 DNS 为公网 223.5.5.5）。但 --full-proxy 模式需要替换 ALL 服务的 DNS（包括 Wi-Fi 的公网 223.5.5.5 → TUN 198.18.0.2），因此需要 `saveAllSystemDnsDarwin` 不区分公/私有保存全部服务。
+
+### execCaptureOutput 空环境问题
+
+`platform.zig:361` 传递空 `envp: .{null}` 给 `execve`。macOS 上以 root 运行时，`networksetup -setdnsservers` 在空环境中可能无法正常执行。日志显示"系统 DNS 已替换"但实际未变更。建议修复：继承父进程环境或传递最小 `PATH=/usr/sbin:/sbin:/usr/bin:/bin`。
