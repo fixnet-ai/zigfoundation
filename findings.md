@@ -394,6 +394,14 @@ zigbox (编排层，连接两者)
 
 `saveSystemDnsDarwin` 通过 `isNonPublicV4` 跳过公网 DNS 服务 — zigbox 正常模式下这是期望行为（只替换内网 DNS 为公网 223.5.5.5）。但 --full-proxy 模式需要替换 ALL 服务的 DNS（包括 Wi-Fi 的公网 223.5.5.5 → TUN 198.18.0.2），因此需要 `saveAllSystemDnsDarwin` 不区分公/私有保存全部服务。
 
-### execCaptureOutput 空环境问题
+### execCaptureOutput null-termination 问题 ✅ 已修复 (2026-07-23)
 
-`platform.zig:361` 传递空 `envp: .{null}` 给 `execve`。macOS 上以 root 运行时，`networksetup -setdnsservers` 在空环境中可能无法正常执行。日志显示"系统 DNS 已替换"但实际未变更。建议修复：继承父进程环境或传递最小 `PATH=/usr/sbin:/sbin:/usr/bin:/bin`。
+**根因**：`execve` 需要 `[*:0]const u8`（null-terminated 字符串），但原始代码对 slice 做 `@ptrCast` 绕过类型检查。运行时分配的字符串（如 `networksetup` 输出）不保证 null-terminated，`execve` 读到未分配内存。
+
+**修复**：子进程中用 `dupeZ` 为 cmd 和所有 args 分配 null-terminated 副本。`execve` + `c.environ` 继承父进程环境。
+
+**修复前两个问题**：
+1. 空 `envp: .{null}` → 改为 `c.environ`（继承父环境）
+2. 未 null-terminated 的 args → 改为 `dupeZ` 分配
+
+**验证**：`networksetup -getdnsservers Wi-Fi` 确认 223.5.5.5 → 198.18.0.2，--full-proxy TUN 模式正常上网。
