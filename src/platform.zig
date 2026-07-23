@@ -292,6 +292,20 @@ pub fn saveSystemDns(allocator: std.mem.Allocator) !SystemDnsState {
     return SystemDnsState.initUnchanged();
 }
 
+/// 强制保存所有网络服务的系统 DNS 配置（不论公网/私有），用于 --full-proxy 等需
+/// 无条件替换系统 DNS 的场景。始终返回 .changed = true，确保退出时正确恢复。
+///
+/// macOS: 保存所有有 DNS 配置的网络服务到 state.data.macos.services。
+/// Linux: 同 saveSystemDns（读取 /etc/resolv.conf）。
+pub fn saveAllSystemDns(allocator: std.mem.Allocator) !SystemDnsState {
+    if (isDarwin) {
+        return saveAllSystemDnsDarwin(allocator);
+    } else if (isLinux) {
+        return saveSystemDnsLinux(allocator);
+    }
+    return SystemDnsState.initUnchanged();
+}
+
 /// 将系统 DNS 替换为指定地址。仅在 state.changed = true 时有效。
 pub fn setSystemDns(allocator: std.mem.Allocator, state: *const SystemDnsState, dns_ip: []const u8) !void {
     if (!state.changed) return;
@@ -454,6 +468,75 @@ fn saveSystemDnsDarwin(allocator: std.mem.Allocator) !SystemDnsState {
         .changed = true,
         .allocator = allocator,
         .data = .{ .macos = .{ .services = try changed_services.toOwnedSlice(allocator) } },
+    };
+}
+
+/// saveAllSystemDnsDarwin — 强制保存所有网络服务的 DNS 配置。
+/// 与 saveSystemDnsDarwin 不同：不检查 isNonPublicV4，所有有 DNS 的服务均保存。
+fn saveAllSystemDnsDarwin(allocator: std.mem.Allocator) !SystemDnsState {
+    const services_output = execCaptureOutput(allocator, "/usr/sbin/networksetup", &.{"-listallnetworkservices"}) catch |err| {
+        std.log.warn("[dns] networksetup -listallnetworkservices 失败: {}", .{err});
+        return SystemDnsState.initUnchanged();
+    };
+    defer allocator.free(services_output);
+
+    var all_services: std.ArrayList([]const u8) = .empty;
+    defer all_services.deinit(allocator);
+    var lines = std.mem.splitScalar(u8, services_output, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (trimmed.len == 0) continue;
+        if (std.mem.indexOfScalar(u8, trimmed, '*') != null) continue;
+        const name = try allocator.dupe(u8, trimmed);
+        try all_services.append(allocator, name);
+    }
+
+    // 保存所有有 DNS 配置的服务（不论公网/私有）
+    var saved_services: std.ArrayList(SystemDnsState.MacOSState.MacOSServiceEntry) = .empty;
+    defer saved_services.deinit(allocator);
+
+    for (all_services.items) |svc_name| {
+        const dns_output = execCaptureOutput(allocator, "/usr/sbin/networksetup", &.{ "-getdnsservers", svc_name }) catch |err| {
+            std.log.warn("[dns] networksetup -getdnsservers {s} 失败: {}", .{ svc_name, err });
+            allocator.free(svc_name);
+            continue;
+        };
+        defer allocator.free(dns_output);
+
+        const trimmed_out = std.mem.trim(u8, dns_output, " \t\r\n");
+        if (trimmed_out.len == 0 or std.mem.startsWith(u8, trimmed_out, "There aren't any")) {
+            allocator.free(svc_name);
+            continue;
+        }
+
+        var servers: std.ArrayList([]const u8) = .empty;
+        var dns_lines = std.mem.splitScalar(u8, trimmed_out, '\n');
+        while (dns_lines.next()) |dns_line| {
+            const ip_str = std.mem.trim(u8, dns_line, " \t\r");
+            if (ip_str.len == 0) continue;
+            const s = try allocator.dupe(u8, ip_str);
+            try servers.append(allocator, s);
+        }
+
+        if (servers.items.len > 0) {
+            try saved_services.append(allocator, .{
+                .name = svc_name,
+                .servers = try servers.toOwnedSlice(allocator),
+            });
+        } else {
+            allocator.free(svc_name);
+            servers.deinit(allocator);
+        }
+    }
+
+    if (saved_services.items.len == 0) {
+        return SystemDnsState.initUnchanged();
+    }
+
+    return SystemDnsState{
+        .changed = true,
+        .allocator = allocator,
+        .data = .{ .macos = .{ .services = try saved_services.toOwnedSlice(allocator) } },
     };
 }
 
